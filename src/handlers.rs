@@ -285,11 +285,12 @@ pub async fn config_probe(
     State(state): State<HoneypotState>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
+    method: Method,
 ) -> Result<Response, Error> {
     log_event(
         &state,
         &headers,
-        &Method::GET,
+        &method,
         uri.path(),
         uri.query(),
         None,
@@ -306,11 +307,12 @@ pub async fn php_probe(
     State(state): State<HoneypotState>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
+    method: Method,
 ) -> Result<Response, Error> {
     log_event(
         &state,
         &headers,
-        &Method::GET,
+        &method,
         uri.path(),
         uri.query(),
         None,
