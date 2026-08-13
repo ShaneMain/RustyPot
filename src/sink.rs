@@ -1,0 +1,66 @@
+//! DB sink for honeypot events. Isolated from the handler module so each file
+//! owns one concept: handlers turn requests into responses, this turns the
+//! request metadata into a `honeypot_event` row.
+//!
+//! `sqlx::query()` (runtime, not the `query!` macro) because `honeypot_event`
+//! is brand new and has no cached `.sqlx/query-*.json` metadata. Generating
+//! that needs a live DB with the migration applied — impossible under the
+//! SQLX_OFFLINE=true gate. The schema is fully specified by 0016_honeypot.sql.
+
+use axum::http::{HeaderMap, Method};
+
+use crate::Error;
+use crate::HoneypotState;
+
+use crate::handlers::MAX_POST_BODY_BYTES;
+use crate::headers::{capture_headers, extract_source_ip, header_str};
+use crate::parsers::truncate_to_boundary;
+
+const MAX_CRED_LEN: usize = 1024;
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn log_event(
+    state: &HoneypotState,
+    headers: &HeaderMap,
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+    post_body: Option<&str>,
+    submitted_user: Option<&str>,
+    submitted_pass: Option<&str>,
+    response_status: u16,
+    response_delay_ms: u32,
+) -> Result<(), Error> {
+    let source_ip = extract_source_ip(headers);
+    let via_cloudflare = headers.contains_key("cf-connecting-ip");
+    let user_agent = header_str(headers, "user-agent").map(str::to_owned);
+    let request_headers = capture_headers(headers);
+    let truncated_body = post_body.map(|b| truncate_to_boundary(b, MAX_POST_BODY_BYTES).to_owned());
+    let user = submitted_user.map(|s| truncate_to_boundary(s, MAX_CRED_LEN).to_owned());
+    let pass = submitted_pass.map(|s| truncate_to_boundary(s, MAX_CRED_LEN).to_owned());
+
+    sqlx::query(
+        r#"
+        INSERT INTO honeypot_event
+            (source_ip, via_cloudflare, user_agent, method, path, query,
+             post_body, submitted_user, submitted_pass, request_headers,
+             response_status, response_delay_ms)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        "#,
+    )
+    .bind(source_ip)
+    .bind(via_cloudflare)
+    .bind(user_agent)
+    .bind(method.as_str())
+    .bind(path)
+    .bind(query)
+    .bind(truncated_body)
+    .bind(user)
+    .bind(pass)
+    .bind(request_headers)
+    .bind(i32::from(response_status))
+    .bind(i32::try_from(response_delay_ms).unwrap_or(0))
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
