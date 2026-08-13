@@ -1,16 +1,11 @@
-use std::net::IpAddr;
-use std::time::Duration;
-
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::headers;
 use crate::parsers::{body_to_string, extract_form_field};
 use crate::sink;
-use crate::sticky;
-use crate::{handlers::TARPIT_DELAY_SECS, Error, HoneypotState};
+use crate::{Error, HoneypotState};
 
 const DRUPAL_LOGIN_HTML: &str = r##"<html><head><title>Log in | Site</title></head><body>
 <form class="user-login-form" action="/user/login" method="post" id="user-login-form" accept-charset="UTF-8">
@@ -94,53 +89,7 @@ pub async fn cms_login(
             let body_str = body_to_string(&body);
             let user = extract_form_field(&body_str, user_field);
             let pass = extract_form_field(&body_str, pass_field);
-
-            let ip: IpAddr = headers::extract_source_ip(&headers)
-                .parse()
-                .unwrap_or(IpAddr::from([0, 0, 0, 0]));
-            let ip_str = headers::extract_source_ip(&headers);
-            let threshold_hit = sticky::check_and_increment(&state.honeypot_tracker, &ip);
-            let granted = if threshold_hit {
-                match (&user, &pass) {
-                    (Some(u), Some(p)) => {
-                        if sink::is_granted_credential(&state.pool, u, p).await? {
-                            false
-                        } else {
-                            sticky::reset_counter(&state.honeypot_tracker, &ip);
-                            true
-                        }
-                    }
-                    _ => false,
-                }
-            } else {
-                false
-            };
-            let delay_ms = if granted {
-                0
-            } else {
-                u32::try_from(TARPIT_DELAY_SECS * 1000).unwrap_or(0)
-            };
-            sink::log_event(
-                &state,
-                &headers,
-                &Method::POST,
-                path,
-                None,
-                Some(body_str.as_str()),
-                user.as_deref(),
-                pass.as_deref(),
-                if granted { 302 } else { 200 },
-                delay_ms,
-            )
-            .await?;
-            if granted {
-                if let (Some(ref u), Some(ref p)) = (&user, &pass) {
-                    let _ = sink::record_granted_credential(&state.pool, u, p, &ip_str).await;
-                }
-                return Ok(sticky::fake_success_response());
-            }
-            tokio::time::sleep(Duration::from_secs(TARPIT_DELAY_SECS)).await;
-            Ok(axum::response::Html(form_html).into_response())
+            sink::trap_and_record(&state, &headers, path, &body_str, user, pass, form_html).await
         }
         _ => Ok(StatusCode::METHOD_NOT_ALLOWED.into_response()),
     }

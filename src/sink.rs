@@ -7,14 +7,18 @@
 //! that needs a live DB with the migration applied — impossible under the
 //! SQLX_OFFLINE=true gate. The schema is fully specified by 0016_honeypot.sql.
 
+use std::net::IpAddr;
+use std::time::Duration;
+
 use axum::http::{HeaderMap, Method};
+use axum::response::{Html, IntoResponse, Response};
 
-use crate::Error;
-use crate::HoneypotState;
-
-use crate::handlers::MAX_POST_BODY_BYTES;
+use crate::handlers::{MAX_POST_BODY_BYTES, TARPIT_DELAY_SECS};
 use crate::headers::{capture_headers, extract_source_ip, header_str};
 use crate::parsers::truncate_to_boundary;
+use crate::sticky;
+use crate::Error;
+use crate::HoneypotState;
 
 const MAX_CRED_LEN: usize = 1024;
 
@@ -100,4 +104,59 @@ pub(crate) async fn record_granted_credential(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub(crate) async fn trap_and_record(
+    state: &HoneypotState,
+    headers: &HeaderMap,
+    path: &str,
+    body_str: &str,
+    user: Option<String>,
+    pass: Option<String>,
+    failure_html: &'static str,
+) -> Result<Response, Error> {
+    let ip_str = extract_source_ip(headers);
+    let ip: IpAddr = ip_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    let threshold_hit = sticky::check_and_increment(&state.honeypot_tracker, &ip);
+    let granted = if threshold_hit {
+        match (&user, &pass) {
+            (Some(u), Some(p)) => {
+                if is_granted_credential(&state.pool, u, p).await? {
+                    false
+                } else {
+                    sticky::reset_counter(&state.honeypot_tracker, &ip);
+                    true
+                }
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    let delay_ms = if granted {
+        0
+    } else {
+        u32::try_from(TARPIT_DELAY_SECS * 1000).unwrap_or(0)
+    };
+    log_event(
+        state,
+        headers,
+        &Method::POST,
+        path,
+        None,
+        Some(body_str),
+        user.as_deref(),
+        pass.as_deref(),
+        if granted { 302 } else { 200 },
+        delay_ms,
+    )
+    .await?;
+    if granted {
+        if let (Some(ref u), Some(ref p)) = (&user, &pass) {
+            let _ = record_granted_credential(&state.pool, u, p, &ip_str).await;
+        }
+        return Ok(sticky::fake_success_response());
+    }
+    tokio::time::sleep(Duration::from_secs(TARPIT_DELAY_SECS)).await;
+    Ok(Html(failure_html).into_response())
 }

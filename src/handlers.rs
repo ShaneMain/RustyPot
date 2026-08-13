@@ -7,7 +7,6 @@
 //! `/xmlrpc.php` doesn't deserve a real response, and not seeing one biases
 //! attackers toward POST where we capture creds.
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -17,10 +16,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use crate::headers;
 use crate::parsers;
 use crate::sink;
-use crate::sticky;
 use crate::templates;
 use crate::Error;
 use crate::HoneypotState;
@@ -74,52 +71,16 @@ pub async fn wp_login(
         Method::POST => {
             let body_str = body_to_string(&body);
             let (user, pass) = parse_form_creds(&body_str);
-            let ip: IpAddr = headers::extract_source_ip(&headers)
-                .parse()
-                .unwrap_or(IpAddr::from([0, 0, 0, 0]));
-            let ip_str = headers::extract_source_ip(&headers);
-            let threshold_hit = sticky::check_and_increment(&state.honeypot_tracker, &ip);
-            let granted = if threshold_hit {
-                match (&user, &pass) {
-                    (Some(u), Some(p)) => {
-                        if sink::is_granted_credential(&state.pool, u, p).await? {
-                            false
-                        } else {
-                            sticky::reset_counter(&state.honeypot_tracker, &ip);
-                            true
-                        }
-                    }
-                    _ => false,
-                }
-            } else {
-                false
-            };
-            let delay_ms = if granted {
-                0
-            } else {
-                u32::try_from(TARPIT_DELAY_SECS * 1000).unwrap_or(0)
-            };
-            log_event(
+            sink::trap_and_record(
                 &state,
                 &headers,
-                &Method::POST,
                 "/wp-login.php",
-                None,
-                Some(body_str.as_str()),
-                user.as_deref(),
-                pass.as_deref(),
-                if granted { 302 } else { 200 },
-                delay_ms,
+                &body_str,
+                user,
+                pass,
+                WP_LOGIN_FORM_ERROR_HTML,
             )
-            .await?;
-            if granted {
-                if let (Some(ref u), Some(ref p)) = (user, pass) {
-                    let _ = sink::record_granted_credential(&state.pool, u, p, &ip_str).await;
-                }
-                return Ok(sticky::fake_success_response());
-            }
-            tokio::time::sleep(Duration::from_secs(TARPIT_DELAY_SECS)).await;
-            Ok(Html(WP_LOGIN_FORM_ERROR_HTML).into_response())
+            .await
         }
         _ => Ok(StatusCode::METHOD_NOT_ALLOWED.into_response()),
     }
