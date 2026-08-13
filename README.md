@@ -1,7 +1,7 @@
 # RustyPot
 
-[![CI](https://github.com/ShaneMain/rustypot/actions/workflows/ci.yml/badge.svg)](https://github.com/ShaneMain/rustypot/actions)
-[![License: GPL-3.0](https://img.shields.io/github/license/ShaneMain/rustypot)](LICENSE)
+[![CI](https://github.com/ShaneMain/RustyPot/actions/workflows/ci.yml/badge.svg)](https://github.com/ShaneMain/RustyPot/actions)
+[![License: GPL-3.0](https://img.shields.io/github/license/ShaneMain/RustyPot)](LICENSE)
 
 Standalone honeypot that traps WordPress / config-file / PHP-shell probes, captures submitted credentials, tarpits each attempt 30 seconds, and fingerprints attackers by the specific password they use at their threshold position.
 
