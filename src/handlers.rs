@@ -286,9 +286,9 @@ pub async fn php_probe(
     Ok(StatusCode::NOT_FOUND.into_response())
 }
 
-const ENV_FILE_TEMPLATE: &str = "APP_NAME=Application\n\
+const ENV_FILE_TEMPLATE: &str = "APP_NAME=Production\n\
 APP_ENV=production\n\
-APP_KEY=base64:dGhpcyBpcyBhIGZha2UgYXBwIGtleQ==\n\
+APP_KEY=base64:Y3zZrN9mBvP4tF8sK2hQ7wJxLnVc6dG1bH5aMsE0pUy=\n\
 APP_DEBUG=false\n\
 \n\
 DB_CONNECTION=pgsql\n\
@@ -307,8 +307,8 @@ MAIL_HOST=smtp.mailtrap.io\n\
 MAIL_PORT=2525\n\
 MAIL_ENCRYPTION=tls\n\
 \n\
-AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n\
-AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n";
+AWS_ACCESS_KEY_ID=AKIA2BS4DJKP9MN7QRXT\n\
+AWS_SECRET_ACCESS_KEY=xT7nQ9vK4pR2bW6mZ8sF3cL1jY5hD0gUeNoVwAt\n";
 
 pub async fn env_honeytrap(
     State(state): State<HoneypotState>,
