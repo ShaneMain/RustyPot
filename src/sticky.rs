@@ -70,6 +70,28 @@ pub fn reset_counter(tracker: &AttemptTracker, ip: &IpAddr) {
     }
 }
 
+/// Generate a per-IP planted credential for the `.env` honeytoken. Deterministic
+/// (same IP always gets the same credential) so correlation works across sessions.
+/// Format: `fk` + 12 alphanumeric chars — looks like a generated database password.
+/// The `fk` prefix makes honeypot-planted credentials easy to identify in queries.
+pub fn planted_credential(ip: &IpAddr) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    ip.hash(&mut hasher);
+    hasher.write(STICKY_SALT);
+    let mut h = hasher.finish();
+
+    let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut result = String::with_capacity(14);
+    result.push_str("fk");
+    for _ in 0..12 {
+        result.push(chars[(h % 62) as usize] as char);
+        h = h.rotate_right(5).wrapping_add(0x9E3779B97F4A7C15);
+    }
+    result
+}
+
 /// Build the fake WP login-success response: 302 redirect to `/wp-admin/` with
 /// `Set-Cookie: wordpress_logged_in_<hash>=...`. The cookie value carries a
 /// fake auth token that looks like a real WP session cookie to any scanner

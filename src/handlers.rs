@@ -286,6 +286,69 @@ pub async fn php_probe(
     Ok(StatusCode::NOT_FOUND.into_response())
 }
 
+const ENV_FILE_TEMPLATE: &str = "APP_NAME=Application\n\
+APP_ENV=production\n\
+APP_KEY=base64:dGhpcyBpcyBhIGZha2UgYXBwIGtleQ==\n\
+APP_DEBUG=false\n\
+\n\
+DB_CONNECTION=pgsql\n\
+DB_HOST=127.0.0.1\n\
+DB_PORT=5432\n\
+DB_DATABASE=application\n\
+DB_USERNAME=app_user\n\
+DB_PASSWORD=__PLANTED__\n\
+\n\
+REDIS_HOST=127.0.0.1\n\
+REDIS_PASSWORD=null\n\
+REDIS_PORT=6379\n\
+\n\
+MAIL_MAILER=smtp\n\
+MAIL_HOST=smtp.mailtrap.io\n\
+MAIL_PORT=2525\n\
+MAIL_ENCRYPTION=tls\n\
+\n\
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n\
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n";
+
+pub async fn env_honeytrap(
+    State(state): State<HoneypotState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    method: Method,
+) -> Result<Response, Error> {
+    use std::net::IpAddr;
+    let ip_str = crate::headers::extract_source_ip(&headers);
+    let ip: IpAddr = ip_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    let credential = crate::sticky::planted_credential(&ip);
+    let env_content = ENV_FILE_TEMPLATE.replace("__PLANTED__", &credential);
+
+    let _ = sink::record_granted_credential(&state.pool, "app_user", &credential, &ip_str).await;
+
+    sink::log_event(
+        &state,
+        &headers,
+        &method,
+        uri.path(),
+        uri.query(),
+        None,
+        Some("app_user"),
+        Some(&credential),
+        200,
+        0,
+    )
+    .await?;
+
+    Ok((
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        env_content,
+    )
+        .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
