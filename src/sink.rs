@@ -19,7 +19,7 @@ use crate::parsers::truncate_to_boundary;
 const MAX_CRED_LEN: usize = 1024;
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn log_event(
+pub(crate) async fn log_event(
     state: &HoneypotState,
     headers: &HeaderMap,
     method: &Method,
@@ -65,7 +65,7 @@ pub(super) async fn log_event(
     Ok(())
 }
 
-pub(super) async fn is_granted_credential(
+pub(crate) async fn is_granted_credential(
     pool: &sqlx::PgPool,
     user: &str,
     pass: &str,
@@ -80,7 +80,7 @@ pub(super) async fn is_granted_credential(
     Ok(row.0 > 0)
 }
 
-pub(super) async fn record_granted_credential(
+pub(crate) async fn record_granted_credential(
     pool: &sqlx::PgPool,
     user: &str,
     pass: &str,

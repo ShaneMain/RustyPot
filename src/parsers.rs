@@ -8,14 +8,14 @@ use axum::body::Bytes;
 /// Lossy UTF-8 conversion of a request body. Most scanner payloads are ASCII
 /// (form-urlencoded / XML); the lossy path only kicks in for hostile bytes,
 /// where preserving exact code points buys nothing for credential capture.
-pub(super) fn body_to_string(body: &Bytes) -> String {
+pub(crate) fn body_to_string(body: &Bytes) -> String {
     String::from_utf8_lossy(body).into_owned()
 }
 
 /// Truncate at a UTF-8 char boundary at or before `max_bytes`. Plain
 /// `&s[..max_bytes]` would panic on a multi-byte boundary; the honeypot's
 /// 4 KiB cut can land mid-character for non-ASCII payloads.
-pub(super) fn truncate_to_boundary(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn truncate_to_boundary(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
@@ -28,20 +28,21 @@ pub(super) fn truncate_to_boundary(s: &str, max_bytes: usize) -> &str {
 
 /// Parse `log` and `pwd` from a form-urlencoded body. Manual implementation
 /// (no `form_urlencoded` in the dep tree) — `+` and `%XX` are decoded.
-pub(super) fn parse_form_creds(body: &str) -> (Option<String>, Option<String>) {
-    let mut user = None;
-    let mut pass = None;
+pub(crate) fn parse_form_creds(body: &str) -> (Option<String>, Option<String>) {
+    (
+        extract_form_field(body, "log"),
+        extract_form_field(body, "pwd"),
+    )
+}
+
+pub(crate) fn extract_form_field(body: &str, field: &str) -> Option<String> {
     for pair in body.split('&') {
         let mut parts = pair.splitn(2, '=');
-        let key = percent_decode(parts.next().unwrap_or(""));
-        let value = percent_decode(parts.next().unwrap_or(""));
-        match key.as_str() {
-            "log" => user = Some(value),
-            "pwd" => pass = Some(value),
-            _ => {}
+        if parts.next().unwrap_or("") == field {
+            return Some(percent_decode(parts.next().unwrap_or("")));
         }
     }
-    (user, pass)
+    None
 }
 
 /// Extract (user, pass) from an XML-RPC body. Across all common attack
@@ -49,7 +50,7 @@ pub(super) fn parse_form_creds(body: &str) -> (Option<String>, Option<String>) {
 /// `wp.getOptions` — the credentials are the LAST two `<string>` values
 /// (methodNames come first when present). With fewer than two `<string>`
 /// tags there is nothing credential-shaped to log.
-pub(super) fn parse_xmlrpc_creds(body: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn parse_xmlrpc_creds(body: &str) -> (Option<String>, Option<String>) {
     let mut strings: Vec<&str> = Vec::new();
     let mut rest = body;
     while let Some(start) = rest.find("<string>") {

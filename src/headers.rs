@@ -7,7 +7,7 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-pub(super) fn extract_source_ip(headers: &HeaderMap) -> String {
+pub(crate) fn extract_source_ip(headers: &HeaderMap) -> String {
     if let Some(v) = header_str(headers, "cf-connecting-ip") {
         return v.to_owned();
     }
@@ -25,11 +25,11 @@ pub(super) fn extract_source_ip(headers: &HeaderMap) -> String {
     "0.0.0.0".to_owned()
 }
 
-pub(super) fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-pub(super) fn capture_headers(headers: &HeaderMap) -> Value {
+pub(crate) fn capture_headers(headers: &HeaderMap) -> Value {
     let mut map = serde_json::Map::new();
     for name in [
         "cf-connecting-ip",

@@ -10,6 +10,7 @@ use axum::Router;
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 use std::num::NonZeroU32;
 
+mod cms;
 mod handlers;
 mod headers;
 mod parsers;
@@ -139,6 +140,15 @@ async fn main() {
             handlers::MAX_POST_BODY_BYTES,
         ));
 
+    let cms_routes = Router::new()
+        .route("/user/login", any(cms::cms_login))
+        .route("/administrator/index.php", any(cms::cms_login))
+        .route("/admin/login", any(cms::cms_login))
+        .route("/admin/login/", any(cms::cms_login))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            handlers::MAX_POST_BODY_BYTES,
+        ));
+
     let admin_routes = Router::new()
         .route("/wp-admin/install.php", get(handlers::wp_admin_install))
         .route("/wp-admin/index.php", get(handlers::wp_admin_index))
@@ -151,6 +161,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .merge(cred_routes)
+        .merge(cms_routes)
         .merge(admin_routes)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
