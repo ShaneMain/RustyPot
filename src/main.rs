@@ -145,8 +145,13 @@ async fn main() {
         .route("/administrator/index.php", any(cms::cms_login))
         .route("/admin/login", any(cms::cms_login))
         .route("/admin/login/", any(cms::cms_login))
+        .route("/admin/{*rest}", any(handlers::post_exploit_capture))
+        .route(
+            "/administrator/{*rest}",
+            any(handlers::post_exploit_capture),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(
-            handlers::MAX_POST_BODY_BYTES,
+            handlers::MAX_EXPLOIT_BODY_BYTES,
         ));
 
     let admin_routes = Router::new()
