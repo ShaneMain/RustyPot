@@ -3,34 +3,43 @@
 [![CI](https://github.com/ShaneMain/RustyPot/actions/workflows/ci.yml/badge.svg)](https://github.com/ShaneMain/RustyPot/actions)
 [![License: GPL-3.0](https://img.shields.io/github/license/ShaneMain/RustyPot)](LICENSE)
 
-Standalone honeypot that traps WordPress / config-file / PHP-shell probes, captures submitted credentials, tarpits each attempt 30 seconds, and fingerprints attackers by the specific password they use at their threshold position.
+Honeypot for exploit-path probes. Serves fake WordPress / Drupal / Joomla / Django login pages and config files, tarpits credential submissions 30 seconds each, fingerprints attackers by the specific password they use at their threshold position, and plants per-IP honeytokens in fake `.env` responses for cross-vector correlation.
 
 ## Fingerprinting
 
-Each probing IP has a deterministic threshold (10-100 POST attempts, derived from `hash(ip + STICKY_SALT)`). Different IPs get different thresholds. When the counter reaches the threshold, the submitted credential is checked against `granted_credentials`:
+Each probing IP has a deterministic threshold (10-100, derived from `hash(ip + STICKY_SALT)`). Different IPs get different thresholds. The counter increments per credential POST and pins at threshold until the attacker submits a password not already in `granted_credentials`. On a new password: grant fake login success (302 + cookies), record it, reset the counter. On a known password: withhold the grant, keep the counter pinned, let the attacker churn through their dictionary (each attempt still costs 30s of tarpit).
 
-- **New password** → grant fake login success (302 + WP auth cookies), record the credential, reset the counter.
-- **Already-known password** → don't grant. The counter stays pinned at threshold, so every subsequent attempt also fires the check. The attacker churns through their remaining dictionary (each attempt still gets the 30s tarpit) until they submit a password that isn't in the table yet.
+Each IP thus contributes unique passwords. When one appears later from a different IP, you can correlate the attackers.
 
-The result: each IP contributes unique passwords to `granted_credentials`. When one of those passwords appears later from a different IP, you can correlate the attackers — even if they've rotated infrastructure.
+## `.env` honeytoken
 
-```
-IP 1.2.3.4   threshold=23  →  granted on attempt 23: admin/qwerty123
-IP 5.6.7.8   threshold=67  →  granted on attempt 67: admin/passw0rd!
-IP 9.10.11.12 threshold=12 →  granted on attempt 12: admin/letmein
-```
+`GET /.env` returns a realistic `.env` file containing a per-IP planted DB password (`fk` + 12 chars, deterministic from IP hash). The password is inserted into `granted_credentials`. If an attacker reads the `.env` and later submits that password at any login form, the submission is captured in `honeypot_event` and matchable to the original `.env` probe — correlating the attacker across vectors and infrastructure.
 
 ## Trapped paths
 
 | Path | Method | Behavior |
 |---|---|---|
-| `/wp-login.php` | GET | Fake WP login form |
-| `/wp-login.php` | POST | Parse creds, tarpit 30s, return error — or 302 on threshold grant |
-| `/xmlrpc.php` | POST | Parse XML-RPC creds, tarpit 30s, return fault |
-| `/wp-admin/*` | any | GET: fake dashboard. POST: capture body (webshell source, file edits) |
+| **Credential capture** | | |
+| `/wp-login.php` | any | GET: fake WP login form. POST: parse creds, tarpit, threshold/fingerprint logic |
+| `/xmlrpc.php` | POST | Parse XML-RPC creds, tarpit, return fault |
+| `/user/login` | any | GET: fake Drupal login form. POST: parse `name`/`pass`, same threshold logic |
+| `/administrator/index.php` | any | GET: fake Joomla admin login. POST: parse `username`/`passwd` |
+| `/admin/login/` | any | GET: fake Django admin login. POST: parse `username`/`password` |
+| **Honeytoken** | | |
+| `/.env` `/.env.local` `/.env.production` | any | Return fake `.env` with per-IP planted credential |
+| **Post-exploitation capture** | | |
+| `/wp-admin/*` | any | Fake dashboard. POST: capture body (webshell source, file edits, spam) |
+| `/admin/*` | any | Drupal/Django post-login capture |
+| `/administrator/*` | any | Joomla post-login capture |
 | `/wp-json/*` | any | GET: 200 `[]`. POST: capture body, return 201 |
-| `/.env` `/.git/*` | GET | 404 + log |
-| `/phpinfo.php` `/index.php` | GET | 404 + log |
+| **Passive 404 + log** | | |
+| `/.git/*` `/.svn/*` `/.hg/*` | any | VCS exposure probes |
+| `/.aws/*` `/.ssh/*` | any | Cloud key / SSH key probes |
+| `/actuator/*` `/_ignition/*` | any | Spring Boot / Laravel debug endpoints |
+| `/solr/*` `/server-status` `/server-info` | any | Service exposure |
+| `/composer.json` `/package.json` | GET | Dependency file probes |
+| `/phpinfo.php` `/shell.php` `/c99.php` `/r57.php` `/webshell.php` `/index.php` `/adminer.php` | any | PHP shell probes |
+| `/phpmyadmin/*` `/phpMyAdmin/*` `/pma/*` `/dbadmin/*` `/mysql/*` `/sqlmanager/*` | any | DB admin variants |
 
 ## Deploy
 
@@ -40,8 +49,6 @@ docker run -p 8080:8080 \
   -e STICKY_SALT=$(openssl rand -hex 32) \
   ghcr.io/shanemain/rustypot:latest
 ```
-
-For Cloud Run and Cloudflare Worker routing, see the commands below.
 
 <details>
 <summary>Cloud Run</summary>
@@ -60,9 +67,7 @@ gcloud run deploy rustypot \
 <details>
 <summary>Cloudflare Worker (edge routing)</summary>
 
-Deploy `cloudflare-worker.js` via Wrangler. Exploit-path prefixes route to RustyPot; everything else passes through to your app. The attacker sees the same hostname.
-
-Set `HONEYPOT_BACKEND` and `APP_BACKEND` as Worker secrets.
+Deploy `cloudflare-worker.js` via Wrangler. Exploit-path prefixes route to RustyPot; everything else passes through to your app. The attacker sees the same hostname. Set `HONEYPOT_BACKEND` and `APP_BACKEND` as Worker secrets.
 </details>
 
 ## Configuration
@@ -70,13 +75,13 @@ Set `HONEYPOT_BACKEND` and `APP_BACKEND` as Worker secrets.
 | Env var | Required | Default | Description |
 |---|---|---|---|
 | `DATABASE_URL` | yes | — | Postgres connection string (TLS required) |
-| `STICKY_SALT` | recommended | `rustypot-default` | Salt for per-IP threshold derivation. Set to a random value per deployment. |
+| `STICKY_SALT` | recommended | `rustypot-default` | Salt for per-IP threshold + honeytoken derivation. Set to a random value per deployment. |
 | `PORT` | no | `8080` | Listen port |
 | `RUST_LOG` | no | `info` | Tracing filter |
 
-## Database schema
+## Database
 
-See `migrations/001_honeypot.sql`. Two tables:
+See `migrations/`. Two tables:
 
 - `honeypot_event` — one row per request (source_ip, ua, method, path, post_body, submitted creds, response status, tarpit delay)
 - `granted_credentials` — fingerprint registry (username, password, first-granted IP, grant count)
@@ -95,13 +100,10 @@ See `migrations/001_honeypot.sql`. Two tables:
 
 ## Roadmap
 
-- [ ] Drupal, Joomla, Ghost trap routes
+- [ ] Ghost trap routes (`/ghost/api/admin/session`)
+- [ ] Magento trap routes (`/admin`, array-style form fields)
 - [ ] IP enrichment (ASN, cloud provider, geo)
-- [ ] Localization capture (Accept-Language, CF-IPCountry)
-
-## Origin
-
-Extracted from [FillerKiller](https://fillerkiller.app), a TV filler-episode voting app. In its first 67 days the honeypot captured 2,461 exploit-path probes from 8 attacker IPs.
+- [ ] Localization capture (`Accept-Language`, `CF-IPCountry`)
 
 ## License
 
