@@ -12,54 +12,25 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use axum::http::header::SET_COOKIE;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-static STICKY_SALT: OnceLock<Box<[u8]>> = OnceLock::new();
+/// Compile-time salt for threshold derivation. Not a secret — just prevents the
+/// attacker from computing thresholds if they learn the algorithm.
+const STICKY_SALT: &[u8] = b"fk-honeypot-sticky-2026";
 
-fn sticky_salt() -> &'static [u8] {
-    STICKY_SALT.get_or_init(|| {
-        std::env::var("STICKY_SALT")
-            .unwrap_or_else(|_| "rustypot-default".to_string())
-            .into_bytes()
-            .into_boxed_slice()
-    })
-}
-
-/// Canary credential — submitting this pair immediately grants the fake success,
-/// bypassing the threshold. Catches low-volume scanners that try 3-5 common
-/// passwords then move on (the majority of automated bots).
-const CANARY_USER: &str = "admin";
-const CANARY_PASS: &str = "admin";
-
-/// Range bounds for the per-IP threshold. The user chose 10-100.
 const THRESHOLD_MIN: u32 = 10;
 const THRESHOLD_MAX: u32 = 100;
 
-/// Fake MD5-style hash for the WP cookie name. WP uses `md5(siteurl)`; the exact
-/// value doesn't matter — scanners check for the `wordpress_logged_in_*` pattern.
 const WP_COOKIE_HASH: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
-/// Per-instance attempt tracker. Keyed on source IP. The value is the running
-/// POST count. When it crosses `threshold_for_ip(ip)`, the bot gets a fake
-/// success. After that, ALL subsequent POSTs from that IP also succeed (so the
-/// bot doesn't get suspicious if it re-submits).
 pub type AttemptTracker = Mutex<HashMap<IpAddr, u32>>;
 
 pub fn new_tracker() -> AttemptTracker {
     Mutex::new(HashMap::new())
-}
-
-/// Returns true if the submitted credential matches the canary pair.
-/// Case-insensitive on the username; exact match on the password.
-pub fn is_canary_credential(user: Option<&str>, pass: Option<&str>) -> bool {
-    match (user, pass) {
-        (Some(u), Some(p)) => u.eq_ignore_ascii_case(CANARY_USER) && p == CANARY_PASS,
-        _ => false,
-    }
 }
 
 /// Derive the threshold for an IP. Deterministic: same IP → same threshold.
@@ -70,20 +41,25 @@ pub fn threshold_for_ip(ip: &IpAddr) -> u32 {
 
     let mut hasher = DefaultHasher::new();
     ip.hash(&mut hasher);
-    hasher.write(sticky_salt());
+    hasher.write(STICKY_SALT);
     let h = hasher.finish();
     THRESHOLD_MIN + (h % (THRESHOLD_MAX - THRESHOLD_MIN + 1) as u64) as u32
 }
 
 /// Increment the attempt count for `ip` and return `true` if the threshold has
-/// been reached (or was already passed). Once true, always returns true for
-/// that IP — the "login" stays valid.
+/// been reached. One-shot: resets the counter to 0 on hit, so the attacker
+/// must churn through another full N attempts for the next grant.
 pub fn check_and_increment(tracker: &AttemptTracker, ip: &IpAddr) -> bool {
     let threshold = threshold_for_ip(ip);
     let mut map = tracker.lock().expect("honeypot tracker poisoned");
     let count = map.entry(*ip).or_insert(0);
     *count += 1;
-    *count >= threshold
+    if *count >= threshold {
+        *count = 0;
+        true
+    } else {
+        false
+    }
 }
 
 /// Build the fake WP login-success response: 302 redirect to `/wp-admin/` with
@@ -172,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn check_and_increment_reaches_threshold_then_stays_true() {
+    fn check_and_increment_reaches_threshold_then_resets() {
         let tracker = new_tracker();
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let threshold = threshold_for_ip(&ip);
@@ -188,8 +164,8 @@ mod tests {
             "attempt {threshold} should grant"
         );
         assert!(
-            check_and_increment(&tracker, &ip),
-            "attempt after threshold should stay granted"
+            !check_and_increment(&tracker, &ip),
+            "attempt after grant should NOT grant — counter reset to 0"
         );
     }
 
@@ -210,24 +186,5 @@ mod tests {
             cookies.iter().any(|c| c.contains("wordpress_sec_")),
             "missing sec cookie: {cookies:?}"
         );
-    }
-
-    #[test]
-    fn canary_credential_grants_immediately() {
-        assert!(is_canary_credential(Some("admin"), Some("admin")));
-        assert!(
-            is_canary_credential(Some("Admin"), Some("admin")),
-            "username should be case-insensitive"
-        );
-        assert!(is_canary_credential(Some("ADMIN"), Some("admin")));
-    }
-
-    #[test]
-    fn non_canary_credentials_do_not_grant() {
-        assert!(!is_canary_credential(Some("admin"), Some("password")));
-        assert!(!is_canary_credential(Some("admin"), Some("admin123")));
-        assert!(!is_canary_credential(Some("root"), Some("admin")));
-        assert!(!is_canary_credential(None, Some("admin")));
-        assert!(!is_canary_credential(Some("admin"), None));
     }
 }

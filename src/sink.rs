@@ -64,3 +64,40 @@ pub(super) async fn log_event(
     .await?;
     Ok(())
 }
+
+pub(super) async fn is_granted_credential(
+    pool: &sqlx::PgPool,
+    user: &str,
+    pass: &str,
+) -> Result<bool, Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM granted_credentials WHERE username = $1 AND password = $2",
+    )
+    .bind(user)
+    .bind(pass)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0 > 0)
+}
+
+pub(super) async fn record_granted_credential(
+    pool: &sqlx::PgPool,
+    user: &str,
+    pass: &str,
+    source_ip: &str,
+) -> Result<(), Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO granted_credentials (username, password, first_granted_ip)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (username, password) DO UPDATE
+        SET grant_count = granted_credentials.grant_count + 1
+        "#,
+    )
+    .bind(user)
+    .bind(pass)
+    .bind(source_ip)
+    .execute(pool)
+    .await?;
+    Ok(())
+}

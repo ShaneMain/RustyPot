@@ -77,8 +77,16 @@ pub async fn wp_login(
             let ip: IpAddr = headers::extract_source_ip(&headers)
                 .parse()
                 .unwrap_or(IpAddr::from([0, 0, 0, 0]));
-            let granted = sticky::is_canary_credential(user.as_deref(), pass.as_deref())
-                || sticky::check_and_increment(&state.honeypot_tracker, &ip);
+            let ip_str = headers::extract_source_ip(&headers);
+            let threshold_hit = sticky::check_and_increment(&state.honeypot_tracker, &ip);
+            let granted = if threshold_hit {
+                match (&user, &pass) {
+                    (Some(u), Some(p)) => !sink::is_granted_credential(&state.pool, u, p).await?,
+                    _ => false,
+                }
+            } else {
+                false
+            };
             let delay_ms = if granted {
                 0
             } else {
@@ -98,6 +106,9 @@ pub async fn wp_login(
             )
             .await?;
             if granted {
+                if let (Some(ref u), Some(ref p)) = (user, pass) {
+                    let _ = sink::record_granted_credential(&state.pool, u, p, &ip_str).await;
+                }
                 return Ok(sticky::fake_success_response());
             }
             tokio::time::sleep(Duration::from_secs(TARPIT_DELAY_SECS)).await;
