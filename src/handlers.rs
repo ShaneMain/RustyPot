@@ -81,7 +81,14 @@ pub async fn wp_login(
             let threshold_hit = sticky::check_and_increment(&state.honeypot_tracker, &ip);
             let granted = if threshold_hit {
                 match (&user, &pass) {
-                    (Some(u), Some(p)) => !sink::is_granted_credential(&state.pool, u, p).await?,
+                    (Some(u), Some(p)) => {
+                        if sink::is_granted_credential(&state.pool, u, p).await? {
+                            false
+                        } else {
+                            sticky::reset_counter(&state.honeypot_tracker, &ip);
+                            true
+                        }
+                    }
                     _ => false,
                 }
             } else {

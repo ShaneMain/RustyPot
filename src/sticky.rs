@@ -47,18 +47,26 @@ pub fn threshold_for_ip(ip: &IpAddr) -> u32 {
 }
 
 /// Increment the attempt count for `ip` and return `true` if the threshold has
-/// been reached. One-shot: resets the counter to 0 on hit, so the attacker
-/// must churn through another full N attempts for the next grant.
+/// been reached. Once at threshold, stays there (returns `true` on every call)
+/// until `reset_counter` is called — so the attacker keeps getting checked
+/// against the DB until they submit a NEW credential, at which point the
+/// handler resets the counter for the next cycle.
 pub fn check_and_increment(tracker: &AttemptTracker, ip: &IpAddr) -> bool {
     let threshold = threshold_for_ip(ip);
     let mut map = tracker.lock().expect("honeypot tracker poisoned");
     let count = map.entry(*ip).or_insert(0);
-    *count += 1;
-    if *count >= threshold {
+    if *count < threshold {
+        *count += 1;
+    }
+    *count >= threshold
+}
+
+/// Reset the counter for `ip` to 0. Called by the handler after a successful
+/// unique-credential grant, starting the next threshold cycle.
+pub fn reset_counter(tracker: &AttemptTracker, ip: &IpAddr) {
+    let mut map = tracker.lock().expect("honeypot tracker poisoned");
+    if let Some(count) = map.get_mut(ip) {
         *count = 0;
-        true
-    } else {
-        false
     }
 }
 
@@ -148,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn check_and_increment_reaches_threshold_then_resets() {
+    fn check_and_increment_pins_at_threshold_until_reset() {
         let tracker = new_tracker();
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let threshold = threshold_for_ip(&ip);
@@ -164,8 +172,13 @@ mod tests {
             "attempt {threshold} should grant"
         );
         assert!(
+            check_and_increment(&tracker, &ip),
+            "counter pinned at threshold — should keep returning true"
+        );
+        reset_counter(&tracker, &ip);
+        assert!(
             !check_and_increment(&tracker, &ip),
-            "attempt after grant should NOT grant — counter reset to 0"
+            "after reset, counter is 0 — first increment should not grant"
         );
     }
 
