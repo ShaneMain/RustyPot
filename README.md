@@ -1,66 +1,38 @@
-<p align="center">
-  <h1 align="center">🪤 RustyPot</h1>
-  <p align="center">Self-hosted exploit-path honeypot with per-attacker fingerprinting</p>
-</p>
+# RustyPot
 
-<p align="center">
-  <a href="https://github.com/ShaneMain/rustypot/actions"><img src="https://github.com/ShaneMain/rustypot/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust">
-  <img src="https://img.shields.io/badge/axum-0.8-blue.svg" alt="Axum">
-  <img src="https://img.shields.io/github/license/ShaneMain/rustypot?color=blue" alt="License">
-  <img src="https://img.shields.io/github/last-commit/ShaneMain/rustypot" alt="Last commit">
-  <img src="https://img.shields.io/github/stars/ShaneMain/rustypot?style=social" alt="Stars">
-</p>
+[![CI](https://github.com/ShaneMain/rustypot/actions/workflows/ci.yml/badge.svg)](https://github.com/ShaneMain/rustypot/actions)
+[![License: GPL-3.0](https://img.shields.io/github/license/ShaneMain/rustypot)](LICENSE)
 
----
+Standalone honeypot that traps WordPress / config-file / PHP-shell probes, captures submitted credentials, tarpits each attempt 30 seconds, and fingerprints attackers by the specific password they use at their threshold position.
 
-## What it does
+## Fingerprinting
 
-When bots probe your site for WordPress, config files, and PHP shells, RustyPot:
+Each probing IP has a deterministic threshold (10-100 POST attempts, derived from `hash(ip + STICKY_SALT)`). Different IPs get different thresholds. When the counter reaches the threshold, the submitted credential is checked against `granted_credentials`:
 
-1. **Serves realistic fake responses** — WP login forms, XML-RPC faults, admin dashboards
-2. **Tarpits every attempt** — 30-second delay per POST, wasting the attacker's VPS compute
-3. **Captures every credential** — usernames, passwords, XML-RPC tokens, full POST bodies
-4. **Grants fake login success** on a per-IP threshold — then records what the bot does next
-5. **Fingerprints each attacker** via the specific password they use at their threshold position
+- **New password** → grant fake login success (302 + WP auth cookies), record the credential, reset the counter.
+- **Already-known password** → don't grant. The counter stays pinned at threshold, so every subsequent attempt also fires the check. The attacker churns through their remaining dictionary (each attempt still gets the 30s tarpit) until they submit a password that isn't in the table yet.
 
-## How the fingerprinting works
-
-This is RustyPot's signature feature. Each probing IP has a **deterministic threshold** (10-100 attempts, derived from a hash of the IP + a deployment-specific salt). Different IPs get different thresholds.
+The result: each IP contributes unique passwords to `granted_credentials`. When one of those passwords appears later from a different IP, you can correlate the attackers — even if they've rotated infrastructure.
 
 ```
-IP 1.2.3.4  →  threshold = 23  →  granted on their 23rd password: "admin/qwerty123"
-IP 5.6.7.8  →  threshold = 67  →  granted on their 67th password: "admin/passw0rd!"
-IP 9.10.11.12 → threshold = 12 → granted on their 12th password: "admin/letmein"
+IP 1.2.3.4   threshold=23  →  granted on attempt 23: admin/qwerty123
+IP 5.6.7.8   threshold=67  →  granted on attempt 67: admin/passw0rd!
+IP 9.10.11.12 threshold=12 →  granted on attempt 12: admin/letmein
 ```
 
-The password at the threshold position becomes that attacker's **fingerprint tag**. It's recorded in the `granted_credentials` table. When that same password appears again from **any** IP, you can correlate the attackers — even if they switch infrastructure.
-
-**The threshold is one-shot**: after granting, the counter resets to zero. The attacker churns through another full N attempts (each costing 30s of tarpit) before the next grant. This maximizes:
-
-- **Password capture** — every failed attempt logs the submitted credential
-- **VPS time wasted** — 30s per attempt × N attempts = minutes of wasted compute per cycle
-- **Fingerprint diversity** — each cycle can contribute a different unique password
-
-**Known passwords are rejected**: if the threshold fires but the submitted password is already in `granted_credentials`, the grant is silently withheld. The attacker burns the cycle for nothing and keeps churning. This ensures each entry in the fingerprint table is unique.
-
-## Currently trapped paths
+## Trapped paths
 
 | Path | Method | Behavior |
 |---|---|---|
 | `/wp-login.php` | GET | Fake WP login form |
-| `/wp-login.php` | POST | Parse `log`/`pwd`, tarpit 30s, return "Incorrect password" — or fake 302 on threshold |
+| `/wp-login.php` | POST | Parse creds, tarpit 30s, return error — or 302 on threshold grant |
 | `/xmlrpc.php` | POST | Parse XML-RPC creds, tarpit 30s, return fault |
-| `/wp-admin/*` | GET | Fake admin dashboard |
-| `/wp-admin/*` | POST | **Capture body** — webshell source code, file edits, spam content |
-| `/wp-json/*` | GET | 200 + empty JSON array |
-| `/wp-json/*` | POST | **Capture body** — user creation, post injection |
-| `/.env`, `/.git/*` | GET | 404 + log |
-| `/phpinfo.php`, `/index.php` | GET | 404 + log |
+| `/wp-admin/*` | any | GET: fake dashboard. POST: capture body (webshell source, file edits) |
+| `/wp-json/*` | any | GET: 200 `[]`. POST: capture body, return 201 |
+| `/.env` `/.git/*` | GET | 404 + log |
+| `/phpinfo.php` `/index.php` | GET | 404 + log |
 
-## Quick start
-
-### Docker
+## Deploy
 
 ```bash
 docker run -p 8080:8080 \
@@ -69,7 +41,10 @@ docker run -p 8080:8080 \
   ghcr.io/shanemain/rustypot:latest
 ```
 
-### Cloud Run
+For Cloud Run and Cloudflare Worker routing, see the commands below.
+
+<details>
+<summary>Cloud Run</summary>
 
 ```bash
 gcloud run deploy rustypot \
@@ -80,104 +55,54 @@ gcloud run deploy rustypot \
   --allow-unauthenticated \
   --max-instances 3 --memory 256Mi --timeout 60
 ```
+</details>
 
-### Cloudflare Worker (traffic routing)
+<details>
+<summary>Cloudflare Worker (edge routing)</summary>
 
-Deploy `cloudflare-worker.js` to split traffic at the edge — exploit paths go to RustyPot, everything else to your app. The attacker sees the same hostname; the split is invisible.
+Deploy `cloudflare-worker.js` via Wrangler. Exploit-path prefixes route to RustyPot; everything else passes through to your app. The attacker sees the same hostname.
+
+Set `HONEYPOT_BACKEND` and `APP_BACKEND` as Worker secrets.
+</details>
 
 ## Configuration
 
 | Env var | Required | Default | Description |
 |---|---|---|---|
-| `DATABASE_URL` | Yes | — | Postgres connection string (TLS required) |
-| `PORT` | No | `8080` | HTTP listen port |
-| `STICKY_SALT` | **Set this** | `rustypot-default` | Salt for per-IP threshold derivation. Each deployment should have a unique random value so attackers can't compute thresholds from the public source. |
-| `RUST_LOG` | No | `info` | Tracing filter |
+| `DATABASE_URL` | yes | — | Postgres connection string (TLS required) |
+| `STICKY_SALT` | recommended | `rustypot-default` | Salt for per-IP threshold derivation. Set to a random value per deployment. |
+| `PORT` | no | `8080` | Listen port |
+| `RUST_LOG` | no | `info` | Tracing filter |
 
-## Database
+## Database schema
 
-```sql
-CREATE TABLE honeypot_event (
-    id              BIGSERIAL    PRIMARY KEY,
-    ts              TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    source_ip       TEXT         NOT NULL,
-    via_cloudflare  BOOLEAN      NOT NULL,
-    user_agent      TEXT,
-    method          TEXT         NOT NULL,
-    path            TEXT         NOT NULL,
-    post_body       TEXT,              -- truncated to 4 KiB
-    submitted_user  TEXT,
-    submitted_pass  TEXT,
-    response_status INTEGER      NOT NULL,
-    response_delay_ms INTEGER    NOT NULL DEFAULT 0
-);
+See `migrations/001_honeypot.sql`. Two tables:
 
-CREATE TABLE granted_credentials (
-    username        TEXT        NOT NULL,
-    password        TEXT        NOT NULL,
-    first_granted_ts TIMESTAMPTZ NOT NULL DEFAULT now(),
-    first_granted_ip TEXT,
-    grant_count     INTEGER     NOT NULL DEFAULT 1,
-    PRIMARY KEY (username, password)
-);
-```
-
-## Grafana dashboard
-
-Query `honeypot_event` + `granted_credentials` via Postgres for:
-
-- **Hits/day** — attack volume over time
-- **Top attacker IPs** — who's probing the most
-- **Top passwords** — the dictionary the bots are cycling
-- **Fingerprint tags** — which password was granted to which IP, and where it's been seen since
-- **Captured payloads** — webshell source code, spam content, file edits from post-exploitation
-- **Fake-success triggers** (`response_status = 302`) — when attackers "got in"
+- `honeypot_event` — one row per request (source_ip, ua, method, path, post_body, submitted creds, response status, tarpit delay)
+- `granted_credentials` — fingerprint registry (username, password, first-granted IP, grant count)
 
 ## Architecture
 
 ```
-                    ┌──────────────────┐
-                    │   Cloudflare     │
-                    │   (edge Worker)  │
-                    └──┬───────────┬───┘
-           exploit paths│           │everything else
-                       ▼           ▼
-              ┌────────────┐  ┌──────────┐
-              │  RustyPot  │  │ Your App │
-              │  (honeypot)│  │          │
-              └─────┬──────┘  └──────────┘
-                    │
-                    ▼
-              ┌────────────┐
-              │  Postgres  │
-              │ (captures) │
-              └────────────┘
+         Cloudflare Worker
+         /              \
+   exploit paths    everything else
+        |                |
+   RustyPot          Your App
+        |
+   Postgres
 ```
-
-## Features
-
-- 🪤 **Sticky trap** — fake login success after 10-100 per-IP attempts (deterministic, one-shot)
-- 🔑 **Per-attacker fingerprinting** — each IP's threshold-crossing password becomes a unique tag
-- 🐌 **30-second tarpit** — every failed credential attempt wastes the attacker's compute
-- 📦 **Post-exploitation capture** — `/wp-admin/*` POST bodies logged (webshells, file edits, spam)
-- 🛡️ **Rate-limited** — 10 req/min/IP prevents self-DoS via tarpit concurrency
-- 📊 **Grafana-ready** — all data in queryable Postgres tables
-- ☁️ **Cloud Run native** — reads `PORT`, health check on `/health`, autoscaling-friendly
-- 🔒 **GPL-3.0** — copyleft, same as the project it was born from
 
 ## Roadmap
 
-- [ ] Drupal trap routes (`/user/login`, `/admin/config`)
-- [ ] Joomla trap routes (`/administrator/index.php`)
-- [ ] Ghost trap routes (`/ghost/api/admin/session`)
-- [ ] IP enrichment (ASN, cloud provider, geo) via background script
-- [ ] Localization capture (`Accept-Language`, `CF-IPCountry`, WP submit button text)
-- [ ] Mastodon/Fediverse exploitation detection
+- [ ] Drupal, Joomla, Ghost trap routes
+- [ ] IP enrichment (ASN, cloud provider, geo)
+- [ ] Localization capture (Accept-Language, CF-IPCountry)
 
 ## Origin
 
-RustyPot was born defending [FillerKiller](https://fillerkiller.app), a TV filler-episode voting app. In its first 67 days live, it captured 2,461 exploit-path probes from 8 unique attacker IPs, including a sustained WordPress credential-stuffing campaign from a DigitalOcean VPS. The honeypot was extracted into this standalone container so others can deploy the same defense.
+Extracted from [FillerKiller](https://fillerkiller.app), a TV filler-episode voting app. In its first 67 days the honeypot captured 2,461 exploit-path probes from 8 attacker IPs.
 
 ## License
 
-[GPL-3.0](LICENSE) — because security tools should be free and open.
+GPL-3.0
