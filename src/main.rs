@@ -10,6 +10,7 @@ use axum::Router;
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 use std::num::NonZeroU32;
 
+mod canary;
 mod cms;
 mod handlers;
 mod headers;

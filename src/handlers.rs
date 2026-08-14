@@ -24,10 +24,7 @@ use crate::HoneypotState;
 
 use parsers::{body_to_string, parse_form_creds, parse_xmlrpc_creds};
 use sink::log_event;
-use templates::{
-    WP_ADMIN_DASHBOARD_HTML, WP_INSTALL_HTML, WP_LOGIN_FORM_ERROR_HTML, WP_LOGIN_FORM_HTML,
-    XMLRPC_FAULT_BODY,
-};
+use templates::{WP_INSTALL_HTML, WP_LOGIN_FORM_ERROR_HTML, WP_LOGIN_FORM_HTML, XMLRPC_FAULT_BODY};
 
 /// Per-credential-submission delay. Bounded attacker sweep rate even when the
 /// upstream CDN rate-limiter is bypassed; intentionally past most bot HTTP
@@ -121,6 +118,10 @@ pub async fn wp_admin_index(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Response, Error> {
+    use std::net::IpAddr;
+    let ip: IpAddr = crate::headers::extract_source_ip(&headers)
+        .parse()
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]));
     log_event(
         &state,
         &headers,
@@ -134,7 +135,7 @@ pub async fn wp_admin_index(
         0,
     )
     .await?;
-    Ok(Html(WP_ADMIN_DASHBOARD_HTML).into_response())
+    Ok(Html(crate::canary::admin_dashboard(&ip)).into_response())
 }
 
 pub async fn wp_admin_install(
@@ -239,7 +240,11 @@ pub async fn post_exploit_capture(
         0,
     )
     .await?;
-    Ok(Html(WP_ADMIN_DASHBOARD_HTML).into_response())
+    use std::net::IpAddr;
+    let ip: IpAddr = crate::headers::extract_source_ip(&headers)
+        .parse()
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    Ok(Html(crate::canary::admin_dashboard(&ip)).into_response())
 }
 
 pub async fn config_probe(

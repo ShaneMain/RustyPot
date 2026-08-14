@@ -77,30 +77,6 @@ html{background:#f0f0f1;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",
 </div>
 </body></html>"##;
 
-pub(super) const WP_ADMIN_DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<title>Dashboard &mdash; WordPress</title>
-<style>
-html{background:#f0f0f1;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
-#login{width:360px;margin:120px auto;padding:30px;background:#fff;border:1px solid #c3c4c7;}
-#login h1{font-size:20px;margin:0 0 16px;}
-.notice{background:#fff;border-left:4px solid #72aee6;padding:12px;margin:0 0 20px;}
-a{color:#2271b1;}
-</style></head>
-<body>
-<div id="login">
-<h1>You must log in to access this page.</h1>
-<div class="notice">Please log in to continue to the administration area.</div>
-<form name="loginform" id="loginform" action="/wp-login.php" method="post">
-<p><label>Username<br><input type="text" name="log" class="input" size="20"></label></p>
-<p><label>Password<br><input type="password" name="pwd" class="input" size="20"></label></p>
-<p><input type="submit" name="wp-submit" class="button" value="Log In">
-<input type="hidden" name="redirect_to" value="/wp-admin/">
-<input type="hidden" name="testcookie" value="1"></p>
-</form>
-</div>
-</body></html>"#;
-
 pub(super) const WP_INSTALL_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <title>WordPress &rsaquo; Setup Configuration File</title>
@@ -158,15 +134,6 @@ mod tests {
     fn wp_login_error_has_error_div() {
         assert!(WP_LOGIN_FORM_ERROR_HTML.contains(r#"id="login_error""#));
         assert!(WP_LOGIN_FORM_ERROR_HTML.contains(r#"form name="loginform""#));
-    }
-
-    #[test]
-    fn wp_admin_dashboard_mentions_log_in() {
-        let lower = WP_ADMIN_DASHBOARD_HTML.to_lowercase();
-        assert!(
-            lower.contains("log in"),
-            "expected 'log in' in dashboard bait text"
-        );
     }
 
     #[test]
