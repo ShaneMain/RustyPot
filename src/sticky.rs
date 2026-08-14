@@ -22,9 +22,6 @@ use axum::response::{IntoResponse, Response};
 /// attacker from computing thresholds if they learn the algorithm.
 const STICKY_SALT: &[u8] = b"fk-honeypot-sticky-2026";
 
-const THRESHOLD_MIN: u32 = 10;
-const THRESHOLD_MAX: u32 = 100;
-
 const WP_COOKIE_HASH: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
 pub type AttemptTracker = Mutex<HashMap<IpAddr, u32>>;
@@ -55,18 +52,9 @@ pub fn increment_grants(tracker: &GrantTracker, ip: &IpAddr) {
         .or_insert(0) += 1;
 }
 
-pub fn escalated_delay(grants: u32) -> u64 {
-    match grants {
-        0 => 30,
-        1 => 60,
-        2 => 120,
-        _ => 240,
-    }
-}
-
 /// Derive the threshold for an IP. Deterministic: same IP → same threshold.
 /// Uses `DefaultHasher` (SipHash-1-3) with the IP + salt.
-pub fn threshold_for_ip(ip: &IpAddr) -> u32 {
+pub fn threshold_for_ip(ip: &IpAddr, min: u32, max: u32) -> u32 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -74,7 +62,8 @@ pub fn threshold_for_ip(ip: &IpAddr) -> u32 {
     ip.hash(&mut hasher);
     hasher.write(STICKY_SALT);
     let h = hasher.finish();
-    THRESHOLD_MIN + (h % (THRESHOLD_MAX - THRESHOLD_MIN + 1) as u64) as u32
+    let span = u64::from(max.saturating_sub(min).saturating_add(1));
+    min + (h % span) as u32
 }
 
 /// Increment the attempt count for `ip` and return `true` if the threshold has
@@ -82,8 +71,8 @@ pub fn threshold_for_ip(ip: &IpAddr) -> u32 {
 /// until `reset_counter` is called — so the attacker keeps getting checked
 /// against the DB until they submit a NEW credential, at which point the
 /// handler resets the counter for the next cycle.
-pub fn check_and_increment(tracker: &AttemptTracker, ip: &IpAddr) -> bool {
-    let threshold = threshold_for_ip(ip);
+pub fn check_and_increment(tracker: &AttemptTracker, ip: &IpAddr, min: u32, max: u32) -> bool {
+    let threshold = threshold_for_ip(ip, min, max);
     let mut map = tracker.lock().expect("honeypot tracker poisoned");
     let count = map.entry(*ip).or_insert(0);
     if *count < threshold {
@@ -103,9 +92,9 @@ pub fn reset_counter(tracker: &AttemptTracker, ip: &IpAddr) {
 
 /// Generate a per-IP planted credential for the `.env` honeytoken. Deterministic
 /// (same IP always gets the same credential) so correlation works across sessions.
-/// Format: `fk` + 12 alphanumeric chars — looks like a generated database password.
-/// The `fk` prefix makes honeypot-planted credentials easy to identify in queries.
-pub fn planted_credential(ip: &IpAddr) -> String {
+/// The caller-supplied prefix makes honeypot-planted credentials identifiable
+/// in queries without tying every deployment to the same marker.
+pub fn planted_credential(ip: &IpAddr, prefix: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
@@ -114,8 +103,8 @@ pub fn planted_credential(ip: &IpAddr) -> String {
     let mut h = hasher.finish();
 
     let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut result = String::with_capacity(14);
-    result.push_str("fk");
+    let mut result = String::with_capacity(prefix.len() + 12);
+    result.push_str(prefix);
     for _ in 0..12 {
         result.push(chars[(h % 62) as usize] as char);
         h = h.rotate_right(5).wrapping_add(0x9E3779B97F4A7C15);
@@ -127,7 +116,7 @@ pub fn planted_credential(ip: &IpAddr) -> String {
 /// `Set-Cookie: wordpress_logged_in_<hash>=...`. The cookie value carries a
 /// fake auth token that looks like a real WP session cookie to any scanner
 /// checking for the `wordpress_logged_in_*` pattern.
-pub fn fake_success_response(grants: u32) -> Response {
+pub fn fake_success_response(grants: u32, settings: &crate::config::Settings) -> Response {
     let expiry = fake_cookie_expiry();
     let token = fake_auth_token();
     let cookie_val = format!("admin%7C{expiry}%7C{token}");
@@ -147,9 +136,9 @@ pub fn fake_success_response(grants: u32) -> Response {
         ))
         .expect("valid cookie"),
     );
-    if grants == 0 {
-        let val = "Z".repeat(400);
-        for i in 0..20u32 {
+    if grants == 0 && settings.cookie_bomb_enabled() {
+        let val = "Z".repeat(settings.cookie_bomb_size);
+        for i in 0..settings.cookie_bomb_count {
             headers.append(
                 SET_COOKIE,
                 HeaderValue::from_str(&format!("_fk_s_{i}={val}; path=/")).expect("valid cookie"),
@@ -183,6 +172,7 @@ mod tests {
 
     #[test]
     fn threshold_is_in_range() {
+        let (min, max) = (10u32, 100u32);
         for ip in [
             IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
             IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
@@ -190,10 +180,10 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(137, 184, 79, 235)),
             IpAddr::V6(Ipv6Addr::LOCALHOST),
         ] {
-            let t = threshold_for_ip(&ip);
+            let t = threshold_for_ip(&ip, min, max);
             assert!(
-                (THRESHOLD_MIN..=THRESHOLD_MAX).contains(&t),
-                "threshold {t} for {ip} not in [{THRESHOLD_MIN}, {THRESHOLD_MAX}]"
+                (min..=max).contains(&t),
+                "threshold {t} for {ip} not in [{min}, {max}]"
             );
         }
     }
@@ -201,7 +191,10 @@ mod tests {
     #[test]
     fn threshold_is_deterministic_per_ip() {
         let ip = IpAddr::V4(Ipv4Addr::new(137, 184, 79, 235));
-        assert_eq!(threshold_for_ip(&ip), threshold_for_ip(&ip));
+        assert_eq!(
+            threshold_for_ip(&ip, 10, 100),
+            threshold_for_ip(&ip, 10, 100)
+        );
     }
 
     #[test]
@@ -209,7 +202,10 @@ mod tests {
         let ip_a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
         let ip_b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
         let ip_c = IpAddr::V4(Ipv4Addr::new(3, 3, 3, 3));
-        let thresholds: Vec<u32> = [ip_a, ip_b, ip_c].iter().map(threshold_for_ip).collect();
+        let thresholds: Vec<u32> = [ip_a, ip_b, ip_c]
+            .iter()
+            .map(|ip| threshold_for_ip(ip, 10, 100))
+            .collect();
         let unique: std::collections::HashSet<u32> = thresholds.iter().copied().collect();
         assert!(
             unique.len() > 1,
@@ -221,32 +217,33 @@ mod tests {
     fn check_and_increment_pins_at_threshold_until_reset() {
         let tracker = new_tracker();
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let threshold = threshold_for_ip(&ip);
+        let threshold = threshold_for_ip(&ip, 10, 100);
 
         for i in 1..threshold {
             assert!(
-                !check_and_increment(&tracker, &ip),
+                !check_and_increment(&tracker, &ip, 10, 100),
                 "attempt {i} should not grant (threshold={threshold})"
             );
         }
         assert!(
-            check_and_increment(&tracker, &ip),
+            check_and_increment(&tracker, &ip, 10, 100),
             "attempt {threshold} should grant"
         );
         assert!(
-            check_and_increment(&tracker, &ip),
+            check_and_increment(&tracker, &ip, 10, 100),
             "counter pinned at threshold — should keep returning true"
         );
         reset_counter(&tracker, &ip);
         assert!(
-            !check_and_increment(&tracker, &ip),
+            !check_and_increment(&tracker, &ip, 10, 100),
             "after reset, counter is 0 — first increment should not grant"
         );
     }
 
     #[test]
     fn fake_success_response_has_wp_cookies() {
-        let resp = fake_success_response(0);
+        let settings = crate::config::Settings::default();
+        let resp = fake_success_response(0, &settings);
         let cookies: Vec<&str> = resp
             .headers()
             .get_all(SET_COOKIE)

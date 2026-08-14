@@ -35,7 +35,7 @@ Beyond passive capture, RustyPot actively wastes attacker resources:
 | `/administrator/index.php` | any | Joomla admin login + cred capture |
 | `/admin/login/` | any | Django admin login + cred capture |
 | **Honeytoken** | | |
-| `/.env` `/.env.local` `/.env.production` | any | Fake `.env` with per-IP planted credential |
+| `/.env*` (any variant: `.env.dev`, `.envrc`, `.env_copy`, ...) and `/{subdir}/.env*` | any | Fake `.env` with per-IP planted credential — matches any path segment containing `.env` |
 | **Active traps** | | |
 | `/.git/*` | any | Infinite git-object chain (config → HEAD → refs → objects → loop) |
 | `/wp-admin/*` | any | Fake dashboard with canary links. POST: capture body |
@@ -90,8 +90,16 @@ Deploy `cloudflare-worker.js` via Wrangler. Exploit-path prefixes route to Rusty
 | `DATABASE_URL` | yes | — | Postgres connection string (TLS required) |
 | `STICKY_SALT` | recommended | `rustypot-default` | Salt for threshold + honeytoken derivation. Set per deployment. |
 | `ENABLED_TRAPS` | no | `all` | Comma-separated trap families to enable. See below. |
+| `TARPIT_ESCALATION` | no | `30,60,120,240` | Comma-separated tarpit ladder (seconds). Nth value applies after Nth grant; last value repeats. Cap 3600s/entry — keep below your platform's request timeout. |
+| `THRESHOLD_MIN` / `THRESHOLD_MAX` | no | `10` / `100` | Per-IP grant threshold range. Swapped automatically if min > max. |
+| `RATE_LIMIT_PER_MINUTE` | no | `10` | Per-IP rate limit across all honeypot routes. |
+| `HONEYTOKEN_PREFIX` | no | `fk` | 1-8 alphanumeric chars prefixing planted credentials. |
+| `COOKIE_BOMB_COUNT` | no | `20` | Cookies set on first grant. `0` disables the bomb. |
+| `COOKIE_BOMB_SIZE` | no | `400` | Bytes per bomb cookie. |
 | `PORT` | no | `8080` | Listen port |
 | `RUST_LOG` | no | `info` | Tracing filter |
+
+Invalid values log a warning at startup and fall back to defaults.
 
 ### Trap families
 

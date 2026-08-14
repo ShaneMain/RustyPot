@@ -117,7 +117,13 @@ pub(crate) async fn trap_and_record(
 ) -> Result<Response, Error> {
     let ip_str = extract_source_ip(headers);
     let ip: IpAddr = ip_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
-    let threshold_hit = sticky::check_and_increment(&state.honeypot_tracker, &ip);
+    let s = &state.settings;
+    let threshold_hit = sticky::check_and_increment(
+        &state.honeypot_tracker,
+        &ip,
+        s.threshold_min,
+        s.threshold_max,
+    );
     let granted = if threshold_hit {
         match (&user, &pass) {
             (Some(u), Some(p)) => {
@@ -133,7 +139,7 @@ pub(crate) async fn trap_and_record(
     } else {
         false
     };
-    let tarpit_secs = sticky::escalated_delay(sticky::grant_count(&state.grant_tracker, &ip));
+    let tarpit_secs = s.tarpit_delay(sticky::grant_count(&state.grant_tracker, &ip));
     let delay_ms = if granted {
         0
     } else {
@@ -158,7 +164,7 @@ pub(crate) async fn trap_and_record(
         }
         let grants_before = sticky::grant_count(&state.grant_tracker, &ip);
         sticky::increment_grants(&state.grant_tracker, &ip);
-        return Ok(sticky::fake_success_response(grants_before));
+        return Ok(sticky::fake_success_response(grants_before, s));
     }
     tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
     Ok(Html(failure_html).into_response())

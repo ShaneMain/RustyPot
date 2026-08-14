@@ -21,7 +21,7 @@ mod sink;
 mod sticky;
 mod templates;
 
-use config::{TrapConfig, TrapFamily};
+use config::{Settings, TrapConfig, TrapFamily};
 
 pub type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
@@ -31,6 +31,7 @@ pub struct HoneypotState {
     pub rate_limiter: Arc<IpRateLimiter>,
     pub honeypot_tracker: Arc<sticky::AttemptTracker>,
     pub grant_tracker: Arc<sticky::GrantTracker>,
+    pub settings: Arc<Settings>,
 }
 
 pub enum Error {
@@ -97,17 +98,21 @@ async fn main() {
         .await
         .expect("failed to connect to Postgres");
 
-    let quota = Quota::per_minute(NonZeroU32::new(10).expect("non-zero"));
-    let rate_limiter = Arc::new(RateLimiter::keyed(quota));
-
     let trap_config = TrapConfig::from_env();
     tracing::info!("enabled trap families: {:?}", trap_config.enabled);
+    let settings = Arc::new(Settings::from_env());
+
+    let quota = Quota::per_minute(
+        NonZeroU32::new(settings.rate_limit_per_minute).expect("rate limit validated >= 1"),
+    );
+    let rate_limiter = Arc::new(RateLimiter::keyed(quota));
 
     let state = HoneypotState {
         pool,
         rate_limiter,
         honeypot_tracker: Arc::new(sticky::new_tracker()),
         grant_tracker: Arc::new(sticky::new_grant_tracker()),
+        settings: settings.clone(),
     };
     let cfg = &trap_config;
 
@@ -129,6 +134,9 @@ async fn main() {
             .route("/.env", any(handlers::env_honeytrap))
             .route("/.env.local", any(handlers::env_honeytrap))
             .route("/.env.production", any(handlers::env_honeytrap));
+    }
+    if cfg.is_enabled(TrapFamily::EnvHoneytoken) {
+        cred_routes = cred_routes.route("/{*rest}", any(handlers::env_catch));
     }
     if cfg.is_enabled(TrapFamily::Git) {
         cred_routes = cred_routes.route("/.git/{*rest}", any(git::git_honeytrap));

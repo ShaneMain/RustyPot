@@ -95,6 +95,131 @@ impl TrapConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub tarpit_ladder: Vec<u64>,
+    pub threshold_min: u32,
+    pub threshold_max: u32,
+    pub rate_limit_per_minute: u32,
+    pub honeytoken_prefix: String,
+    pub cookie_bomb_count: usize,
+    pub cookie_bomb_size: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            tarpit_ladder: vec![30, 60, 120, 240],
+            threshold_min: 10,
+            threshold_max: 100,
+            rate_limit_per_minute: 10,
+            honeytoken_prefix: "fk".to_owned(),
+            cookie_bomb_count: 20,
+            cookie_bomb_size: 400,
+        }
+    }
+}
+
+const MAX_TARPIT_SECONDS: u64 = 3600;
+
+impl Settings {
+    pub fn from_env() -> Self {
+        let d = Settings::default();
+        let mut s = d.clone();
+
+        if let Ok(raw) = env::var("TARPIT_ESCALATION") {
+            match parse_ladder(&raw) {
+                Ok(ladder) => s.tarpit_ladder = ladder,
+                Err(e) => tracing::warn!("TARPIT_ESCALATION: {e} — using default"),
+            }
+        }
+        s.threshold_min = env_num("THRESHOLD_MIN", d.threshold_min, 1, 100_000);
+        s.threshold_max = env_num("THRESHOLD_MAX", d.threshold_max, 1, 100_000);
+        if s.threshold_min > s.threshold_max {
+            tracing::warn!(
+                "THRESHOLD_MIN ({}) > THRESHOLD_MAX ({}) — swapping",
+                s.threshold_min,
+                s.threshold_max
+            );
+            std::mem::swap(&mut s.threshold_min, &mut s.threshold_max);
+        }
+        s.rate_limit_per_minute =
+            env_num("RATE_LIMIT_PER_MINUTE", d.rate_limit_per_minute, 1, 100_000);
+        if let Ok(raw) = env::var("HONEYTOKEN_PREFIX") {
+            let raw = raw.trim();
+            if !raw.is_empty() && raw.len() <= 8 && raw.chars().all(|c| c.is_ascii_alphanumeric()) {
+                s.honeytoken_prefix = raw.to_owned();
+            } else {
+                tracing::warn!("HONEYTOKEN_PREFIX must be 1-8 alphanumeric chars — using default");
+            }
+        }
+        s.cookie_bomb_count = env_num(
+            "COOKIE_BOMB_COUNT",
+            u32::try_from(d.cookie_bomb_count).unwrap_or(20),
+            0,
+            100,
+        ) as usize;
+        s.cookie_bomb_size = env_num(
+            "COOKIE_BOMB_SIZE",
+            u32::try_from(d.cookie_bomb_size).unwrap_or(400),
+            0,
+            4000,
+        ) as usize;
+        s
+    }
+
+    /// Tarpit delay after `grants` fake-success grants. Indexes the ladder;
+    /// values beyond the last entry repeat the last. 0 grants → first entry.
+    pub fn tarpit_delay(&self, grants: u32) -> u64 {
+        let idx = grants as usize;
+        if idx >= self.tarpit_ladder.len() {
+            *self.tarpit_ladder.last().unwrap_or(&0)
+        } else {
+            self.tarpit_ladder[idx]
+        }
+    }
+
+    pub fn cookie_bomb_enabled(&self) -> bool {
+        self.cookie_bomb_count > 0 && self.cookie_bomb_size > 0
+    }
+}
+
+fn parse_ladder(raw: &str) -> Result<Vec<u64>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("empty value".to_owned());
+    }
+    let mut ladder = Vec::new();
+    for token in raw.split(',') {
+        let v: u64 = token
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid seconds {token:?}"))?;
+        if v > MAX_TARPIT_SECONDS {
+            return Err(format!("value {v} exceeds {MAX_TARPIT_SECONDS}s cap"));
+        }
+        ladder.push(v);
+    }
+    Ok(ladder)
+}
+
+fn env_num(name: &str, default: u32, min: u32, max: u32) -> u32 {
+    match env::var(name) {
+        Ok(raw) => match raw.trim().parse::<u32>() {
+            Ok(v) if v >= min && v <= max => v,
+            Ok(v) => {
+                tracing::warn!("{name}={v} outside [{min}, {max}] — using default {default}");
+                default
+            }
+            Err(_) => {
+                tracing::warn!("{name}={raw:?} not a number — using default {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +285,43 @@ mod tests {
         assert!(!c.is_enabled(TrapFamily::ServiceExposure));
         assert!(c.is_enabled(TrapFamily::Git));
         assert!(c.is_enabled(TrapFamily::EnvHoneytoken));
+    }
+
+    #[test]
+    fn default_tarpit_ladder() {
+        let s = Settings::default();
+        assert_eq!(s.tarpit_delay(0), 30);
+        assert_eq!(s.tarpit_delay(1), 60);
+        assert_eq!(s.tarpit_delay(2), 120);
+        assert_eq!(s.tarpit_delay(3), 240);
+        assert_eq!(s.tarpit_delay(99), 240);
+    }
+
+    #[test]
+    fn custom_ladder_parse() {
+        assert_eq!(parse_ladder("5").unwrap(), vec![5]);
+        assert_eq!(parse_ladder("5,10,20").unwrap(), vec![5, 10, 20]);
+        assert_eq!(parse_ladder(" 5 , 10 ").unwrap(), vec![5, 10]);
+        assert!(parse_ladder("").is_err());
+        assert!(parse_ladder("5,abc").is_err());
+        assert!(parse_ladder("9999").is_err());
+    }
+
+    #[test]
+    fn single_entry_ladder_repeats() {
+        let s = Settings {
+            tarpit_ladder: vec![45],
+            ..Settings::default()
+        };
+        assert_eq!(s.tarpit_delay(0), 45);
+        assert_eq!(s.tarpit_delay(7), 45);
+    }
+
+    #[test]
+    fn cookie_bomb_toggle() {
+        let mut s = Settings::default();
+        assert!(s.cookie_bomb_enabled());
+        s.cookie_bomb_count = 0;
+        assert!(!s.cookie_bomb_enabled());
     }
 }

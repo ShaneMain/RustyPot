@@ -324,7 +324,7 @@ pub async fn env_honeytrap(
     use std::net::IpAddr;
     let ip_str = crate::headers::extract_source_ip(&headers);
     let ip: IpAddr = ip_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
-    let credential = crate::sticky::planted_credential(&ip);
+    let credential = crate::sticky::planted_credential(&ip, &state.settings.honeytoken_prefix);
     let env_content = ENV_FILE_TEMPLATE.replace("__PLANTED__", &credential);
 
     let _ = sink::record_granted_credential(&state.pool, "app_user", &credential, &ip_str).await;
@@ -354,6 +354,24 @@ pub async fn env_honeytrap(
         .into_response())
 }
 
+fn is_env_variant(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|seg| seg.contains(".env"))
+}
+
+pub async fn env_catch(
+    State(state): State<HoneypotState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    method: Method,
+) -> Result<Response, Error> {
+    if !is_env_variant(uri.path()) {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    env_honeytrap(State(state), OriginalUri(uri), headers, method).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +379,25 @@ mod tests {
     #[test]
     fn tarpit_constant_is_thirty_seconds() {
         assert_eq!(TARPIT_DELAY_SECS, 30);
+    }
+
+    #[test]
+    fn env_variant_detection() {
+        assert!(is_env_variant("/.env.dev"));
+        assert!(is_env_variant("/.envrc"));
+        assert!(is_env_variant("/.env.dev.local"));
+        assert!(is_env_variant("/.env_copy"));
+        assert!(is_env_variant("/.env.example"));
+        assert!(is_env_variant("/core/.env"));
+        assert!(is_env_variant("/web/.env"));
+        assert!(is_env_variant("/backend/.env"));
+        assert!(is_env_variant("/config.env"));
+        assert!(is_env_variant("/.env"));
+        assert!(is_env_variant("src/.env"));
+        assert!(!is_env_variant("/wp-login.php"));
+        assert!(!is_env_variant("/.git/config"));
+        assert!(!is_env_variant("/administrator/index.php"));
+        assert!(!is_env_variant("/"));
+        assert!(!is_env_variant("/environment")); // no dot — real word, not a probe
     }
 }
