@@ -26,6 +26,7 @@ pub struct HoneypotState {
     pub pool: sqlx::PgPool,
     pub rate_limiter: Arc<IpRateLimiter>,
     pub honeypot_tracker: Arc<sticky::AttemptTracker>,
+    pub grant_tracker: Arc<sticky::GrantTracker>,
 }
 
 pub enum Error {
@@ -99,6 +100,7 @@ async fn main() {
         pool,
         rate_limiter,
         honeypot_tracker: Arc::new(sticky::new_tracker()),
+        grant_tracker: Arc::new(sticky::new_grant_tracker()),
     };
 
     let cred_routes = Router::new()

@@ -13,7 +13,7 @@ use std::time::Duration;
 use axum::http::{HeaderMap, Method};
 use axum::response::{Html, IntoResponse, Response};
 
-use crate::handlers::{MAX_POST_BODY_BYTES, TARPIT_DELAY_SECS};
+use crate::handlers::MAX_POST_BODY_BYTES;
 use crate::headers::{capture_headers, extract_source_ip, header_str};
 use crate::parsers::truncate_to_boundary;
 use crate::sticky;
@@ -133,10 +133,11 @@ pub(crate) async fn trap_and_record(
     } else {
         false
     };
+    let tarpit_secs = sticky::escalated_delay(sticky::grant_count(&state.grant_tracker, &ip));
     let delay_ms = if granted {
         0
     } else {
-        u32::try_from(TARPIT_DELAY_SECS * 1000).unwrap_or(0)
+        u32::try_from(tarpit_secs * 1000).unwrap_or(0)
     };
     log_event(
         state,
@@ -155,8 +156,9 @@ pub(crate) async fn trap_and_record(
         if let (Some(ref u), Some(ref p)) = (&user, &pass) {
             let _ = record_granted_credential(&state.pool, u, p, &ip_str).await;
         }
+        sticky::increment_grants(&state.grant_tracker, &ip);
         return Ok(sticky::fake_success_response());
     }
-    tokio::time::sleep(Duration::from_secs(TARPIT_DELAY_SECS)).await;
+    tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
     Ok(Html(failure_html).into_response())
 }

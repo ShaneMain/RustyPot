@@ -28,9 +28,40 @@ const THRESHOLD_MAX: u32 = 100;
 const WP_COOKIE_HASH: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
 pub type AttemptTracker = Mutex<HashMap<IpAddr, u32>>;
+pub type GrantTracker = Mutex<HashMap<IpAddr, u32>>;
 
 pub fn new_tracker() -> AttemptTracker {
     Mutex::new(HashMap::new())
+}
+
+pub fn new_grant_tracker() -> GrantTracker {
+    Mutex::new(HashMap::new())
+}
+
+pub fn grant_count(tracker: &GrantTracker, ip: &IpAddr) -> u32 {
+    tracker
+        .lock()
+        .expect("grant tracker poisoned")
+        .get(ip)
+        .copied()
+        .unwrap_or(0)
+}
+
+pub fn increment_grants(tracker: &GrantTracker, ip: &IpAddr) {
+    *tracker
+        .lock()
+        .expect("grant tracker poisoned")
+        .entry(*ip)
+        .or_insert(0) += 1;
+}
+
+pub fn escalated_delay(grants: u32) -> u64 {
+    match grants {
+        0 | 1 => 30,
+        2 => 60,
+        3 => 120,
+        _ => 300,
+    }
 }
 
 /// Derive the threshold for an IP. Deterministic: same IP → same threshold.
