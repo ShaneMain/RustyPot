@@ -12,6 +12,7 @@ use std::num::NonZeroU32;
 
 mod canary;
 mod cms;
+mod config;
 mod git;
 mod handlers;
 mod headers;
@@ -19,6 +20,8 @@ mod parsers;
 mod sink;
 mod sticky;
 mod templates;
+
+use config::{TrapConfig, TrapFamily};
 
 pub type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
@@ -97,75 +100,114 @@ async fn main() {
     let quota = Quota::per_minute(NonZeroU32::new(10).expect("non-zero"));
     let rate_limiter = Arc::new(RateLimiter::keyed(quota));
 
+    let trap_config = TrapConfig::from_env();
+    tracing::info!("enabled trap families: {:?}", trap_config.enabled);
+
     let state = HoneypotState {
         pool,
         rate_limiter,
         honeypot_tracker: Arc::new(sticky::new_tracker()),
         grant_tracker: Arc::new(sticky::new_grant_tracker()),
     };
+    let cfg = &trap_config;
 
-    let cred_routes = Router::new()
-        .route("/wp-login.php", any(handlers::wp_login))
-        .route("/xmlrpc.php", post(handlers::xmlrpc))
-        .route("/wp-json/", any(handlers::wp_json_catch))
-        .route("/wp-json/{*rest}", any(handlers::wp_json_catch))
-        .route("/wp-content/{*rest}", any(handlers::config_probe))
-        .route("/wp-includes/{*rest}", any(handlers::config_probe))
-        .route("/.env", any(handlers::env_honeytrap))
-        .route("/.env.local", any(handlers::env_honeytrap))
-        .route("/.env.production", any(handlers::env_honeytrap))
-        .route("/.git/{*rest}", any(git::git_honeytrap))
-        .route("/.svn/{*rest}", any(handlers::config_probe))
-        .route("/.hg/{*rest}", any(handlers::config_probe))
-        .route("/.aws/{*rest}", any(handlers::config_probe))
-        .route("/.ssh/{*rest}", any(handlers::config_probe))
-        .route("/actuator/{*rest}", any(handlers::config_probe))
-        .route("/_ignition/{*rest}", any(handlers::config_probe))
-        .route("/solr/{*rest}", any(handlers::config_probe))
-        .route("/server-status", any(handlers::config_probe))
-        .route("/server-info", any(handlers::config_probe))
-        .route("/composer.json", get(handlers::config_probe))
-        .route("/composer.lock", get(handlers::config_probe))
-        .route("/package.json", get(handlers::config_probe))
-        .route("/phpinfo.php", any(handlers::php_probe))
-        .route("/index.php", any(handlers::php_probe))
-        .route("/shell.php", any(handlers::php_probe))
-        .route("/c99.php", any(handlers::php_probe))
-        .route("/r57.php", any(handlers::php_probe))
-        .route("/webshell.php", any(handlers::php_probe))
-        .route("/phpmyadmin/{*rest}", any(handlers::config_probe))
-        .route("/phpMyAdmin/{*rest}", any(handlers::config_probe))
-        .route("/pma/{*rest}", any(handlers::config_probe))
-        .route("/dbadmin/{*rest}", any(handlers::config_probe))
-        .route("/mysql/{*rest}", any(handlers::config_probe))
-        .route("/sqlmanager/{*rest}", any(handlers::config_probe))
-        .route("/adminer.php", any(handlers::config_probe))
-        .layer(axum::extract::DefaultBodyLimit::max(
-            handlers::MAX_POST_BODY_BYTES,
-        ));
+    let mut cred_routes = Router::new().layer(axum::extract::DefaultBodyLimit::max(
+        handlers::MAX_POST_BODY_BYTES,
+    ));
 
-    let cms_routes = Router::new()
-        .route("/user/login", any(cms::cms_login))
-        .route("/administrator/index.php", any(cms::cms_login))
-        .route("/admin/login", any(cms::cms_login))
-        .route("/admin/login/", any(cms::cms_login))
-        .route("/admin/{*rest}", any(handlers::post_exploit_capture))
-        .route(
-            "/administrator/{*rest}",
-            any(handlers::post_exploit_capture),
-        )
-        .layer(axum::extract::DefaultBodyLimit::max(
-            handlers::MAX_EXPLOIT_BODY_BYTES,
-        ));
+    if cfg.is_enabled(TrapFamily::WordPress) {
+        cred_routes = cred_routes
+            .route("/wp-login.php", any(handlers::wp_login))
+            .route("/xmlrpc.php", post(handlers::xmlrpc))
+            .route("/wp-json/", any(handlers::wp_json_catch))
+            .route("/wp-json/{*rest}", any(handlers::wp_json_catch))
+            .route("/wp-content/{*rest}", any(handlers::config_probe))
+            .route("/wp-includes/{*rest}", any(handlers::config_probe));
+    }
+    if cfg.is_enabled(TrapFamily::EnvHoneytoken) {
+        cred_routes = cred_routes
+            .route("/.env", any(handlers::env_honeytrap))
+            .route("/.env.local", any(handlers::env_honeytrap))
+            .route("/.env.production", any(handlers::env_honeytrap));
+    }
+    if cfg.is_enabled(TrapFamily::Git) {
+        cred_routes = cred_routes.route("/.git/{*rest}", any(git::git_honeytrap));
+    }
+    if cfg.is_enabled(TrapFamily::Vcs) {
+        cred_routes = cred_routes
+            .route("/.svn/{*rest}", any(handlers::config_probe))
+            .route("/.hg/{*rest}", any(handlers::config_probe));
+    }
+    if cfg.is_enabled(TrapFamily::CloudKeys) {
+        cred_routes = cred_routes
+            .route("/.aws/{*rest}", any(handlers::config_probe))
+            .route("/.ssh/{*rest}", any(handlers::config_probe));
+    }
+    if cfg.is_enabled(TrapFamily::FrameworkDebug) {
+        cred_routes = cred_routes
+            .route("/actuator/{*rest}", any(handlers::config_probe))
+            .route("/_ignition/{*rest}", any(handlers::config_probe));
+    }
+    if cfg.is_enabled(TrapFamily::ServiceExposure) {
+        cred_routes = cred_routes
+            .route("/solr/{*rest}", any(handlers::config_probe))
+            .route("/server-status", any(handlers::config_probe))
+            .route("/server-info", any(handlers::config_probe))
+            .route("/composer.json", get(handlers::config_probe))
+            .route("/composer.lock", get(handlers::config_probe))
+            .route("/package.json", get(handlers::config_probe));
+    }
+    if cfg.is_enabled(TrapFamily::PhpShells) {
+        cred_routes = cred_routes
+            .route("/phpinfo.php", any(handlers::php_probe))
+            .route("/index.php", any(handlers::php_probe))
+            .route("/shell.php", any(handlers::php_probe))
+            .route("/c99.php", any(handlers::php_probe))
+            .route("/r57.php", any(handlers::php_probe))
+            .route("/webshell.php", any(handlers::php_probe));
+    }
+    if cfg.is_enabled(TrapFamily::DbAdmin) {
+        cred_routes = cred_routes
+            .route("/phpmyadmin/{*rest}", any(handlers::config_probe))
+            .route("/phpMyAdmin/{*rest}", any(handlers::config_probe))
+            .route("/pma/{*rest}", any(handlers::config_probe))
+            .route("/dbadmin/{*rest}", any(handlers::config_probe))
+            .route("/mysql/{*rest}", any(handlers::config_probe))
+            .route("/sqlmanager/{*rest}", any(handlers::config_probe))
+            .route("/adminer.php", any(handlers::config_probe));
+    }
 
-    let admin_routes = Router::new()
-        .route("/wp-admin/install.php", get(handlers::wp_admin_install))
-        .route("/wp-admin/index.php", get(handlers::wp_admin_index))
-        .route("/wp-admin/", get(handlers::wp_admin_index))
-        .route("/wp-admin/{*rest}", any(handlers::post_exploit_capture))
-        .layer(axum::extract::DefaultBodyLimit::max(
-            handlers::MAX_EXPLOIT_BODY_BYTES,
-        ));
+    let mut cms_routes = Router::new().layer(axum::extract::DefaultBodyLimit::max(
+        handlers::MAX_EXPLOIT_BODY_BYTES,
+    ));
+    if cfg.is_enabled(TrapFamily::Drupal) {
+        cms_routes = cms_routes.route("/user/login", any(cms::cms_login));
+    }
+    if cfg.is_enabled(TrapFamily::Joomla) {
+        cms_routes = cms_routes
+            .route("/administrator/index.php", any(cms::cms_login))
+            .route(
+                "/administrator/{*rest}",
+                any(handlers::post_exploit_capture),
+            );
+    }
+    if cfg.is_enabled(TrapFamily::Django) {
+        cms_routes = cms_routes
+            .route("/admin/login", any(cms::cms_login))
+            .route("/admin/login/", any(cms::cms_login))
+            .route("/admin/{*rest}", any(handlers::post_exploit_capture));
+    }
+
+    let mut admin_routes = Router::new().layer(axum::extract::DefaultBodyLimit::max(
+        handlers::MAX_EXPLOIT_BODY_BYTES,
+    ));
+    if cfg.is_enabled(TrapFamily::WordPress) {
+        admin_routes = admin_routes
+            .route("/wp-admin/install.php", get(handlers::wp_admin_install))
+            .route("/wp-admin/index.php", get(handlers::wp_admin_index))
+            .route("/wp-admin/", get(handlers::wp_admin_index))
+            .route("/wp-admin/{*rest}", any(handlers::post_exploit_capture));
+    }
 
     let app = Router::new()
         .route("/health", get(health))

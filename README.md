@@ -47,12 +47,14 @@ Beyond passive capture, RustyPot actively wastes attacker resources:
 | `/actuator/*` `/_ignition/*` | any | Spring Boot / Laravel debug endpoints |
 | `/solr/*` `/server-status` `/server-info` | any | Service exposure |
 | `/composer.json` `/package.json` | GET | Dependency file probes |
-| `/phpinfo.php` `/shell.php` `/c99.php` `/r57.php` `/webshell.php` `/index.php` `/adminer.php` | any | PHP shell probes |
-| `/phpmyadmin/*` `/phpMyAdmin/*` `/pma/*` `/dbadmin/*` `/mysql/*` `/sqlmanager/*` | any | DB admin variants |
+| `/phpinfo.php` `/shell.php` `/c99.php` `/r57.php` `/webshell.php` `/index.php` | any | PHP shell probes |
+| `/phpmyadmin/*` `/phpMyAdmin/*` `/pma/*` `/dbadmin/*` `/mysql/*` `/sqlmanager/*` `/adminer.php` | any | DB admin variants |
 
 All routes are rate-limited (10 req/min/IP). Credential POSTs are body-limited to 4 KiB; admin capture routes allow 256 KiB for webshell uploads.
 
 ## Deploy
+
+RustyPot's traps are configurable. By default all are enabled, which suits sites that don't use any of the spoofed paths (Rust/Node/Go APIs, SPAs, static sites). If your site actually runs WordPress (or Drupal, Joomla, Django, Spring Boot), disable the matching trap families so the Worker routes only your dead paths to the honeypot.
 
 ```bash
 docker run -p 8080:8080 \
@@ -87,8 +89,41 @@ Deploy `cloudflare-worker.js` via Wrangler. Exploit-path prefixes route to Rusty
 |---|---|---|---|
 | `DATABASE_URL` | yes | — | Postgres connection string (TLS required) |
 | `STICKY_SALT` | recommended | `rustypot-default` | Salt for threshold + honeytoken derivation. Set per deployment. |
+| `ENABLED_TRAPS` | no | `all` | Comma-separated trap families to enable. See below. |
 | `PORT` | no | `8080` | Listen port |
 | `RUST_LOG` | no | `info` | Tracing filter |
+
+### Trap families
+
+| Family | Claimed paths | Disable if your site... |
+|---|---|---|
+| `wordpress` | `/wp-login.php` `/xmlrpc.php` `/wp-json/*` `/wp-content/*` `/wp-includes/*` `/wp-admin/*` | runs WordPress |
+| `drupal` | `/user/login` | runs Drupal |
+| `joomla` | `/administrator/*` | runs Joomla |
+| `django` | `/admin/login/` `/admin/*` | runs Django/Flask |
+| `git` | `/.git/*` (infinite loop) | serves a git repo |
+| `env-honeytoken` | `/.env*` | serves a real `.env` |
+| `cloud-keys` | `/.aws/*` `/.ssh/*` | |
+| `vcs` | `/.svn/*` `/.hg/*` | |
+| `framework-debug` | `/actuator/*` `/_ignition/*` | runs Spring Boot / Laravel |
+| `php-shells` | `/phpinfo.php` `/index.php` `/shell.php` `/c99.php` `/r57.php` `/webshell.php` | runs PHP |
+| `db-admin` | `/phpmyadmin/*` `/pma/*` `/dbadmin/*` `/mysql/*` `/sqlmanager/*` `/adminer.php` | serves phpMyAdmin |
+| `service-exposure` | `/solr/*` `/server-status` `/server-info` `/composer.json` `/composer.lock` `/package.json` | serves those files |
+
+Disabled families return 404 from RustyPot. If you use the edge router (`cloudflare-worker.js`), also remove the matching prefixes from its `HONEYPOT_PATHS` regex — otherwise the Worker keeps routing those paths to RustyPot and your real site gets 404s instead of traffic. Unknown family names are logged and skipped at startup; `all` (default) and `none` are keywords, and `wp`/`env` are aliases.
+
+Examples:
+
+```bash
+# All traps (default — for sites on non-spoofed stacks like Rust/Node/Go/SPAs)
+ENABLED_TRAPS=all
+
+# Protecting a real WordPress site: keep only dead-path traps
+ENABLED_TRAPS=git,env-honeytoken,cloud-keys,vcs,php-shells,db-admin
+
+# Only credential capture
+ENABLED_TRAPS=wordpress,drupal,joomla,django
+```
 
 ## Database
 
