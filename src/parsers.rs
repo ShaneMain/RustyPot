@@ -124,6 +124,19 @@ mod tests {
         let (user, pass) = parse_form_creds(body);
         assert_eq!(user.as_deref(), Some("admin"));
         assert_eq!(pass.as_deref(), Some("admin@123"));
+        assert_eq!(
+            extract_form_field(body, "wp-submit").as_deref(),
+            Some("Log In")
+        );
+    }
+
+    #[test]
+    fn extracts_localized_submit_text() {
+        let body = "log=admin&pwd=112233&wp-submit=%E7%99%BB%E5%BD%95&testcookie=1";
+        assert_eq!(
+            extract_form_field(body, "wp-submit").as_deref(),
+            Some("登录")
+        );
     }
 
     #[test]
