@@ -12,6 +12,7 @@ use std::num::NonZeroU32;
 
 mod canary;
 mod cms;
+mod git;
 mod handlers;
 mod headers;
 mod parsers;
@@ -113,7 +114,7 @@ async fn main() {
         .route("/.env", any(handlers::env_honeytrap))
         .route("/.env.local", any(handlers::env_honeytrap))
         .route("/.env.production", any(handlers::env_honeytrap))
-        .route("/.git/{*rest}", any(handlers::config_probe))
+        .route("/.git/{*rest}", any(git::git_honeytrap))
         .route("/.svn/{*rest}", any(handlers::config_probe))
         .route("/.hg/{*rest}", any(handlers::config_probe))
         .route("/.aws/{*rest}", any(handlers::config_probe))
