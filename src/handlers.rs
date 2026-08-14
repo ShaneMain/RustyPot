@@ -300,6 +300,7 @@ struct EnvVariant {
     db_name: &'static str,
     db_user: &'static str,
     app_key: &'static str,
+    placeholder: bool,
 }
 
 const ENV_PROD: EnvVariant = EnvVariant {
@@ -308,6 +309,7 @@ const ENV_PROD: EnvVariant = EnvVariant {
     db_name: "application",
     db_user: "app_user",
     app_key: "base64:Y3zZrN9mBvP4tF8sK2hQ7wJxLnVc6dG1bH5aMsE0pUy=",
+    placeholder: false,
 };
 
 const ENV_STAGE: EnvVariant = EnvVariant {
@@ -316,6 +318,7 @@ const ENV_STAGE: EnvVariant = EnvVariant {
     db_name: "application_staging",
     db_user: "staging_user",
     app_key: "base64:Qm7wR2tK8pXzN4vB6mC1sJ5hL0dF3aG7eY9uIoPqRfS=",
+    placeholder: false,
 };
 
 const ENV_LOCAL: EnvVariant = EnvVariant {
@@ -324,11 +327,25 @@ const ENV_LOCAL: EnvVariant = EnvVariant {
     db_name: "application_dev",
     db_user: "dev_user",
     app_key: "base64:Zx4cV1bN7mL2kJ9hG5fD3sA8pQ6wE0rT1yU3iO5pA7u=",
+    placeholder: false,
+};
+
+// Real example/sample files carry placeholder values, never live creds.
+const ENV_EXAMPLE: EnvVariant = EnvVariant {
+    app_env: "local",
+    app_debug: "true",
+    db_name: "application",
+    db_user: "app_user",
+    app_key: "base64:",
+    placeholder: true,
 };
 
 fn env_variant(path: &str) -> &'static EnvVariant {
     let p = path.to_ascii_lowercase();
-    if p.contains("stage") {
+    if p.contains("example") || p.contains("sample") || p.contains("template") || p.contains("dist")
+    {
+        &ENV_EXAMPLE
+    } else if p.contains("stag") {
         &ENV_STAGE
     } else if p.contains("local") || p.contains("dev") || p.ends_with("config.env") {
         &ENV_LOCAL
@@ -338,6 +355,35 @@ fn env_variant(path: &str) -> &'static EnvVariant {
 }
 
 fn build_env_file(v: &EnvVariant, credential: &str) -> String {
+    if v.placeholder {
+        return format!(
+            "APP_NAME={name}\n\
+             APP_ENV={env}\n\
+             APP_KEY=\n\
+             APP_DEBUG={debug}\n\
+             \n\
+             DB_CONNECTION=pgsql\n\
+             DB_HOST=127.0.0.1\n\
+             DB_PORT=5432\n\
+             DB_DATABASE={db}\n\
+             DB_USERNAME={user}\n\
+             DB_PASSWORD=\n\
+             \n\
+             REDIS_HOST=127.0.0.1\n\
+             REDIS_PASSWORD=null\n\
+             REDIS_PORT=6379\n\
+             \n\
+             MAIL_MAILER=smtp\n\
+             MAIL_HOST=\n\
+             MAIL_PORT=2525\n\
+             MAIL_ENCRYPTION=tls\n",
+            name = "Application",
+            env = v.app_env,
+            debug = v.app_debug,
+            db = v.db_name,
+            user = v.db_user,
+        );
+    }
     format!(
         "APP_NAME={name}\n\
          APP_ENV={env}\n\
@@ -387,6 +433,32 @@ pub async fn env_honeytrap(
     let ip: IpAddr = ip_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
     let path = uri.path();
     let variant = env_variant(path);
+
+    if variant.placeholder {
+        sink::log_event(
+            &state,
+            &headers,
+            &method,
+            path,
+            uri.query(),
+            None,
+            None,
+            None,
+            200,
+            0,
+        )
+        .await?;
+        return Ok((
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            build_env_file(variant, ""),
+        )
+            .into_response());
+    }
+
     let credential =
         crate::sticky::planted_credential(&ip, path, &state.settings.honeytoken_prefix);
     let env_content = build_env_file(variant, &credential);
@@ -459,5 +531,39 @@ mod tests {
         assert!(!is_env_variant("/environment"));
         assert!(is_env_variant("/core/.ENV"));
         assert!(is_env_variant("/foo/.env/bar"));
+    }
+
+    #[test]
+    fn env_variant_classifier_mapping() {
+        assert_eq!(env_variant("/.env").app_env, "production");
+        assert_eq!(env_variant("/.env.production").app_env, "production");
+        assert!(!env_variant("/.env").placeholder);
+        assert_eq!(env_variant("/.env.staging").app_env, "staging");
+        assert_eq!(env_variant("/stage/.env").app_env, "staging");
+        assert_eq!(env_variant("/.env.local").app_env, "local");
+        assert_eq!(env_variant("/.env.dev").app_env, "local");
+        assert_eq!(env_variant("/config.env").app_env, "local");
+        assert!(env_variant("/.env.EXAMPLE").placeholder);
+        assert!(env_variant("/.env.sample").placeholder);
+        assert!(env_variant("/.env.template").placeholder);
+        assert!(env_variant("/.env.dist").placeholder);
+    }
+
+    #[test]
+    fn build_env_file_shapes() {
+        let prod = build_env_file(&ENV_PROD, "fkAAA111222333");
+        assert!(prod.contains("APP_DEBUG=false"));
+        assert!(prod.contains("DB_PASSWORD=fkAAA111222333"));
+        assert!(prod.contains("APP_NAME=Production"));
+
+        let local = build_env_file(&ENV_LOCAL, "fkBBB333444555");
+        assert!(local.contains("APP_DEBUG=true"));
+        assert!(local.contains("DB_DATABASE=application_dev"));
+        assert!(local.contains("DB_USERNAME=dev_user"));
+
+        let example = build_env_file(&ENV_EXAMPLE, "");
+        assert!(example.contains("DB_PASSWORD=\n"));
+        assert!(example.contains("APP_KEY=\n"));
+        assert!(!example.contains("AWS_ACCESS_KEY_ID"));
     }
 }
