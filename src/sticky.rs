@@ -90,16 +90,19 @@ pub fn reset_counter(tracker: &AttemptTracker, ip: &IpAddr) {
     }
 }
 
-/// Generate a per-IP planted credential for the `.env` honeytoken. Deterministic
-/// (same IP always gets the same credential) so correlation works across sessions.
-/// The caller-supplied prefix makes honeypot-planted credentials identifiable
-/// in queries without tying every deployment to the same marker.
-pub fn planted_credential(ip: &IpAddr, prefix: &str) -> String {
+/// Generate a planted credential for the `.env` honeytoken, unique per
+/// (IP, path). Deterministic so correlation works across sessions, but the
+/// path seed means a sweeper collecting /.env, /.env.local, /.env.production
+/// gets a DIFFERENT password in each — matching how real multi-env configs
+/// look. Every variant is recorded in granted_credentials against the same IP,
+/// so any one of them submitted at a login form still correlates.
+pub fn planted_credential(ip: &IpAddr, path: &str, prefix: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     ip.hash(&mut hasher);
     hasher.write(STICKY_SALT);
+    hasher.write(path.as_bytes());
     let mut h = hasher.finish();
 
     let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -284,13 +287,28 @@ mod tests {
     #[test]
     fn planted_credential_uses_prefix_and_is_deterministic() {
         let ip = IpAddr::V4(Ipv4Addr::new(137, 184, 79, 235));
-        let a = planted_credential(&ip, "fk");
-        let b = planted_credential(&ip, "fk");
-        assert_eq!(a, b, "same IP + prefix → same credential");
+        let a = planted_credential(&ip, "/.env", "fk");
+        let b = planted_credential(&ip, "/.env", "fk");
+        assert_eq!(a, b, "same IP + path + prefix → same credential");
         assert!(a.starts_with("fk"), "prefix honored: {a}");
         assert_eq!(a.len(), 14);
-        let c = planted_credential(&ip, "wp");
+        let c = planted_credential(&ip, "/.env", "wp");
         assert!(c.starts_with("wp"), "alternate prefix honored: {c}");
         assert_ne!(a, c, "prefix changes the credential");
+    }
+
+    #[test]
+    fn planted_credential_differs_per_env_variant() {
+        let ip = IpAddr::V4(Ipv4Addr::new(64, 89, 161, 82));
+        let creds: Vec<String> = ["/.env", "/.env.local", "/.env.production", "/.env.example"]
+            .iter()
+            .map(|p| planted_credential(&ip, p, "fk"))
+            .collect();
+        let unique: std::collections::HashSet<&String> = creds.iter().collect();
+        assert_eq!(
+            unique.len(),
+            creds.len(),
+            "each env variant must carry a distinct password: {creds:?}"
+        );
     }
 }

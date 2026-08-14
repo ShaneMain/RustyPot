@@ -294,29 +294,87 @@ pub async fn php_probe(
     Ok(StatusCode::NOT_FOUND.into_response())
 }
 
-const ENV_FILE_TEMPLATE: &str = "APP_NAME=Production\n\
-APP_ENV=production\n\
-APP_KEY=base64:Y3zZrN9mBvP4tF8sK2hQ7wJxLnVc6dG1bH5aMsE0pUy=\n\
-APP_DEBUG=false\n\
-\n\
-DB_CONNECTION=pgsql\n\
-DB_HOST=127.0.0.1\n\
-DB_PORT=5432\n\
-DB_DATABASE=application\n\
-DB_USERNAME=app_user\n\
-DB_PASSWORD=__PLANTED__\n\
-\n\
-REDIS_HOST=127.0.0.1\n\
-REDIS_PASSWORD=null\n\
-REDIS_PORT=6379\n\
-\n\
-MAIL_MAILER=smtp\n\
-MAIL_HOST=smtp.mailtrap.io\n\
-MAIL_PORT=2525\n\
-MAIL_ENCRYPTION=tls\n\
-\n\
-AWS_ACCESS_KEY_ID=AKIA2BS4DJKP9MN7QRXT\n\
-AWS_SECRET_ACCESS_KEY=xT7nQ9vK4pR2bW6mZ8sF3cL1jY5hD0gUeNoVwAt\n";
+struct EnvVariant {
+    app_env: &'static str,
+    app_debug: &'static str,
+    db_name: &'static str,
+    db_user: &'static str,
+    app_key: &'static str,
+}
+
+const ENV_PROD: EnvVariant = EnvVariant {
+    app_env: "production",
+    app_debug: "false",
+    db_name: "application",
+    db_user: "app_user",
+    app_key: "base64:Y3zZrN9mBvP4tF8sK2hQ7wJxLnVc6dG1bH5aMsE0pUy=",
+};
+
+const ENV_STAGE: EnvVariant = EnvVariant {
+    app_env: "staging",
+    app_debug: "true",
+    db_name: "application_staging",
+    db_user: "staging_user",
+    app_key: "base64:Qm7wR2tK8pXzN4vB6mC1sJ5hL0dF3aG7eY9uIoPqRfS=",
+};
+
+const ENV_LOCAL: EnvVariant = EnvVariant {
+    app_env: "local",
+    app_debug: "true",
+    db_name: "application_dev",
+    db_user: "dev_user",
+    app_key: "base64:Zx4cV1bN7mL2kJ9hG5fD3sA8pQ6wE0rT1yU3iO5pA7u=",
+};
+
+fn env_variant(path: &str) -> &'static EnvVariant {
+    let p = path.to_ascii_lowercase();
+    if p.contains("stage") {
+        &ENV_STAGE
+    } else if p.contains("local") || p.contains("dev") || p.ends_with("config.env") {
+        &ENV_LOCAL
+    } else {
+        &ENV_PROD
+    }
+}
+
+fn build_env_file(v: &EnvVariant, credential: &str) -> String {
+    format!(
+        "APP_NAME={name}\n\
+         APP_ENV={env}\n\
+         APP_KEY={key}\n\
+         APP_DEBUG={debug}\n\
+         \n\
+         DB_CONNECTION=pgsql\n\
+         DB_HOST=127.0.0.1\n\
+         DB_PORT=5432\n\
+         DB_DATABASE={db}\n\
+         DB_USERNAME={user}\n\
+         DB_PASSWORD={cred}\n\
+         \n\
+         REDIS_HOST=127.0.0.1\n\
+         REDIS_PASSWORD=null\n\
+         REDIS_PORT=6379\n\
+         \n\
+         MAIL_MAILER=smtp\n\
+         MAIL_HOST=smtp.mailtrap.io\n\
+         MAIL_PORT=2525\n\
+         MAIL_ENCRYPTION=tls\n\
+         \n\
+         AWS_ACCESS_KEY_ID=AKIA2BS4DJKP9MN7QRXT\n\
+         AWS_SECRET_ACCESS_KEY=xT7nQ9vK4pR2bW6mZ8sF3cL1jY5hD0gUeNoVwAt\n",
+        name = if v.app_env == "production" {
+            "Production"
+        } else {
+            "Application"
+        },
+        env = v.app_env,
+        key = v.app_key,
+        debug = v.app_debug,
+        db = v.db_name,
+        user = v.db_user,
+        cred = credential,
+    )
+}
 
 pub async fn env_honeytrap(
     State(state): State<HoneypotState>,
@@ -327,19 +385,23 @@ pub async fn env_honeytrap(
     use std::net::IpAddr;
     let ip_str = crate::headers::extract_source_ip(&headers);
     let ip: IpAddr = ip_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]));
-    let credential = crate::sticky::planted_credential(&ip, &state.settings.honeytoken_prefix);
-    let env_content = ENV_FILE_TEMPLATE.replace("__PLANTED__", &credential);
+    let path = uri.path();
+    let variant = env_variant(path);
+    let credential =
+        crate::sticky::planted_credential(&ip, path, &state.settings.honeytoken_prefix);
+    let env_content = build_env_file(variant, &credential);
 
-    let _ = sink::record_granted_credential(&state.pool, "app_user", &credential, &ip_str).await;
+    let _ =
+        sink::record_granted_credential(&state.pool, variant.db_user, &credential, &ip_str).await;
 
     sink::log_event(
         &state,
         &headers,
         &method,
-        uri.path(),
+        path,
         uri.query(),
         None,
-        Some("app_user"),
+        Some(variant.db_user),
         Some(&credential),
         200,
         0,
