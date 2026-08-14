@@ -127,7 +127,7 @@ pub fn planted_credential(ip: &IpAddr) -> String {
 /// `Set-Cookie: wordpress_logged_in_<hash>=...`. The cookie value carries a
 /// fake auth token that looks like a real WP session cookie to any scanner
 /// checking for the `wordpress_logged_in_*` pattern.
-pub fn fake_success_response() -> Response {
+pub fn fake_success_response(grants: u32) -> Response {
     let expiry = fake_cookie_expiry();
     let token = fake_auth_token();
     let cookie_val = format!("admin%7C{expiry}%7C{token}");
@@ -147,6 +147,15 @@ pub fn fake_success_response() -> Response {
         ))
         .expect("valid cookie"),
     );
+    if grants == 0 {
+        let val = "Z".repeat(400);
+        for i in 0..20u32 {
+            headers.append(
+                SET_COOKIE,
+                HeaderValue::from_str(&format!("_fk_s_{i}={val}; path=/")).expect("valid cookie"),
+            );
+        }
+    }
     resp
 }
 
@@ -237,7 +246,7 @@ mod tests {
 
     #[test]
     fn fake_success_response_has_wp_cookies() {
-        let resp = fake_success_response();
+        let resp = fake_success_response(0);
         let cookies: Vec<&str> = resp
             .headers()
             .get_all(SET_COOKIE)

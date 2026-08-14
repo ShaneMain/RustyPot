@@ -156,8 +156,9 @@ pub(crate) async fn trap_and_record(
         if let (Some(ref u), Some(ref p)) = (&user, &pass) {
             let _ = record_granted_credential(&state.pool, u, p, &ip_str).await;
         }
+        let grants_before = sticky::grant_count(&state.grant_tracker, &ip);
         sticky::increment_grants(&state.grant_tracker, &ip);
-        return Ok(sticky::fake_success_response());
+        return Ok(sticky::fake_success_response(grants_before));
     }
     tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
     Ok(Html(failure_html).into_response())
