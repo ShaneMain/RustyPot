@@ -259,4 +259,38 @@ mod tests {
             "missing sec cookie: {cookies:?}"
         );
     }
+
+    #[test]
+    fn cookie_bomb_honors_settings() {
+        fn count_bombs(grants: u32, s: &crate::config::Settings) -> usize {
+            fake_success_response(grants, s)
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .filter(|c| c.contains("_fk_s_"))
+                .count()
+        }
+        let s = crate::config::Settings::default();
+        assert_eq!(count_bombs(0, &s), s.cookie_bomb_count, "first grant bombs");
+        assert_eq!(count_bombs(1, &s), 0, "later grants skip the bomb");
+        let off = crate::config::Settings {
+            cookie_bomb_count: 0,
+            ..s.clone()
+        };
+        assert_eq!(count_bombs(0, &off), 0, "count=0 disables the bomb");
+    }
+
+    #[test]
+    fn planted_credential_uses_prefix_and_is_deterministic() {
+        let ip = IpAddr::V4(Ipv4Addr::new(137, 184, 79, 235));
+        let a = planted_credential(&ip, "fk");
+        let b = planted_credential(&ip, "fk");
+        assert_eq!(a, b, "same IP + prefix → same credential");
+        assert!(a.starts_with("fk"), "prefix honored: {a}");
+        assert_eq!(a.len(), 14);
+        let c = planted_credential(&ip, "wp");
+        assert!(c.starts_with("wp"), "alternate prefix honored: {c}");
+        assert_ne!(a, c, "prefix changes the credential");
+    }
 }

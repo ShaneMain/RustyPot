@@ -15,7 +15,7 @@ use axum::response::{Html, IntoResponse, Response};
 
 use crate::handlers::MAX_POST_BODY_BYTES;
 use crate::headers::{capture_headers, extract_source_ip, header_str};
-use crate::parsers::truncate_to_boundary;
+use crate::parsers::{extract_form_field, truncate_to_boundary};
 use crate::sticky;
 use crate::Error;
 use crate::HoneypotState;
@@ -39,6 +39,12 @@ pub(crate) async fn log_event(
     let via_cloudflare = headers.contains_key("cf-connecting-ip");
     let user_agent = header_str(headers, "user-agent").map(str::to_owned);
     let request_headers = capture_headers(headers);
+    let accept_language = header_str(headers, "accept-language")
+        .map(|s| truncate_to_boundary(s, MAX_CRED_LEN).to_owned());
+    let cf_ipcountry = header_str(headers, "cf-ipcountry").map(str::to_owned);
+    let submit_text = post_body
+        .and_then(|b| extract_form_field(b, "wp-submit"))
+        .map(|s| truncate_to_boundary(&s, 128).to_owned());
     let truncated_body = post_body.map(|b| truncate_to_boundary(b, MAX_POST_BODY_BYTES).to_owned());
     let user = submitted_user.map(|s| truncate_to_boundary(s, MAX_CRED_LEN).to_owned());
     let pass = submitted_pass.map(|s| truncate_to_boundary(s, MAX_CRED_LEN).to_owned());
@@ -48,8 +54,9 @@ pub(crate) async fn log_event(
         INSERT INTO honeypot_event
             (source_ip, via_cloudflare, user_agent, method, path, query,
              post_body, submitted_user, submitted_pass, request_headers,
-             response_status, response_delay_ms)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             response_status, response_delay_ms,
+             accept_language, cf_ipcountry, form_submit_text)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         "#,
     )
     .bind(source_ip)
@@ -64,6 +71,9 @@ pub(crate) async fn log_event(
     .bind(request_headers)
     .bind(i32::from(response_status))
     .bind(i32::try_from(response_delay_ms).unwrap_or(0))
+    .bind(accept_language)
+    .bind(cf_ipcountry)
+    .bind(submit_text)
     .execute(&state.pool)
     .await?;
     Ok(())

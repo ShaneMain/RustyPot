@@ -26,11 +26,6 @@ use parsers::{body_to_string, parse_form_creds, parse_xmlrpc_creds};
 use sink::log_event;
 use templates::{WP_INSTALL_HTML, WP_LOGIN_FORM_ERROR_HTML, WP_LOGIN_FORM_HTML, XMLRPC_FAULT_BODY};
 
-/// Per-credential-submission delay. Bounded attacker sweep rate even when the
-/// upstream CDN rate-limiter is bypassed; intentionally past most bot HTTP
-/// timeouts so the connection is dropped client-side before we finish.
-pub const TARPIT_DELAY_SECS: u64 = 30;
-
 /// Bound on the `post_body` column — matches the migration's 4 KiB design
 /// (enough to capture the leading credential fields of any scanner payload).
 pub const MAX_POST_BODY_BYTES: usize = 4 * 1024;
@@ -88,9 +83,11 @@ pub async fn xmlrpc(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
+    // Base ladder entry — xmlrpc has no grant/threshold tracking, so no escalation.
+    let tarpit_secs = state.settings.tarpit_delay(0);
     let body_str = body_to_string(&body);
     let (user, pass) = parse_xmlrpc_creds(&body_str);
-    let delay_ms = u32::try_from(TARPIT_DELAY_SECS * 1000).unwrap_or(0);
+    let delay_ms = u32::try_from(tarpit_secs * 1000).unwrap_or(0);
     log_event(
         &state,
         &headers,
@@ -104,7 +101,7 @@ pub async fn xmlrpc(
         delay_ms,
     )
     .await?;
-    tokio::time::sleep(Duration::from_secs(TARPIT_DELAY_SECS)).await;
+    tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/xml; charset=utf-8")],
@@ -253,6 +250,12 @@ pub async fn config_probe(
     headers: HeaderMap,
     method: Method,
 ) -> Result<Response, Error> {
+    // Nested env variants (/wp-content/.env, /solr/.env, ...) are honeytoken
+    // material — this route only wins them via family-prefix priority, so
+    // delegate before the 404 swallows the capture.
+    if is_env_variant(uri.path()) {
+        return env_honeytrap(State(state), OriginalUri(uri), headers, method).await;
+    }
     log_event(
         &state,
         &headers,
@@ -355,9 +358,8 @@ pub async fn env_honeytrap(
 }
 
 fn is_env_variant(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .is_some_and(|seg| seg.contains(".env"))
+    path.split('/')
+        .any(|seg| seg.to_ascii_lowercase().contains(".env"))
 }
 
 pub async fn env_catch(
@@ -371,15 +373,9 @@ pub async fn env_catch(
     }
     env_honeytrap(State(state), OriginalUri(uri), headers, method).await
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tarpit_constant_is_thirty_seconds() {
-        assert_eq!(TARPIT_DELAY_SECS, 30);
-    }
 
     #[test]
     fn env_variant_detection() {
@@ -398,6 +394,8 @@ mod tests {
         assert!(!is_env_variant("/.git/config"));
         assert!(!is_env_variant("/administrator/index.php"));
         assert!(!is_env_variant("/"));
-        assert!(!is_env_variant("/environment")); // no dot — real word, not a probe
+        assert!(!is_env_variant("/environment"));
+        assert!(is_env_variant("/core/.ENV"));
+        assert!(is_env_variant("/foo/.env/bar"));
     }
 }
