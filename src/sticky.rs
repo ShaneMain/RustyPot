@@ -57,10 +57,10 @@ pub fn increment_grants(tracker: &GrantTracker, ip: &IpAddr) {
 
 pub fn escalated_delay(grants: u32) -> u64 {
     match grants {
-        0 | 1 => 30,
-        2 => 60,
-        3 => 120,
-        _ => 300,
+        0 => 30,
+        1 => 60,
+        2 => 120,
+        _ => 240,
     }
 }
 
