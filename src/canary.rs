@@ -6,7 +6,7 @@ fn canary_token(ip: &IpAddr, label: &str) -> String {
     let mut h = DefaultHasher::new();
     ip.hash(&mut h);
     h.write(label.as_bytes());
-    format!("{:08x}", h.finish() & 0xFFFF_FFFF)
+    format!("{:016x}", h.finish())
 }
 
 pub fn admin_dashboard(ip: &IpAddr) -> String {
