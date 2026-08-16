@@ -211,7 +211,8 @@ async fn main() {
     ));
     if cfg.is_enabled(TrapFamily::WordPress) {
         admin_routes = admin_routes
-            .route("/wp-admin/install.php", get(handlers::wp_admin_install))
+            .route("/wp-admin/install.php", any(handlers::wp_admin_install))
+            .route("/wp-admin/setup-config.php", any(handlers::wp_setup_config))
             .route("/wp-admin/index.php", get(handlers::wp_admin_index))
             .route("/wp-admin/", get(handlers::wp_admin_index))
             .route("/wp-admin/{*rest}", any(handlers::post_exploit_capture));

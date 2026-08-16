@@ -24,7 +24,10 @@ use crate::HoneypotState;
 
 use parsers::{body_to_string, parse_form_creds, parse_xmlrpc_creds};
 use sink::log_event;
-use templates::{WP_INSTALL_HTML, WP_LOGIN_FORM_ERROR_HTML, WP_LOGIN_FORM_HTML, XMLRPC_FAULT_BODY};
+use templates::{
+    wp_install_success_html, WP_LOGIN_FORM_ERROR_HTML, WP_LOGIN_FORM_HTML,
+    WP_SETUP_CONFIG_DONE_HTML, WP_SETUP_CONFIG_HTML, WP_WELCOME_HTML, XMLRPC_FAULT_BODY,
+};
 
 /// Bound on the `post_body` column — matches the migration's 4 KiB design
 /// (enough to capture the leading credential fields of any scanner payload).
@@ -135,24 +138,146 @@ pub async fn wp_admin_index(
     Ok(Html(crate::canary::admin_dashboard(&ip)).into_response())
 }
 
+/// A parsed installer claim is only recordable when BOTH fields came back
+/// non-empty — a half-parsed form would poison `granted_credentials` with
+/// unusable rows.
+fn recordable_claim(user: &Option<String>, pass: &Option<String>) -> bool {
+    matches!((user, pass), (Some(u), Some(p)) if !u.is_empty() && !p.is_empty())
+}
+
+/// `wp-admin/install.php` — the installer-claim trap. GET serves the
+/// five-minute-install form; `?step=2` POST is a kit claiming the site with
+/// its chosen admin credentials. The chosen pair is recorded with
+/// `origin='install'` (so `wp-login.php` verification grants it immediately,
+/// bypassing the stuffer threshold) and answered with the Success page plus
+/// WP session cookies + the first-grant cookie bomb.
 pub async fn wp_admin_install(
     State(state): State<HoneypotState>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
+    method: Method,
+    body: Bytes,
 ) -> Result<Response, Error> {
-    log_event(
-        &state,
-        &headers,
-        &Method::GET,
-        "/wp-admin/install.php",
-        None,
-        None,
-        None,
-        None,
-        200,
-        0,
-    )
-    .await?;
-    Ok(Html(WP_INSTALL_HTML).into_response())
+    use std::net::IpAddr;
+    let ip: IpAddr = crate::headers::extract_source_ip(&headers)
+        .parse()
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    match method {
+        Method::GET => {
+            log_event(
+                &state,
+                &headers,
+                &Method::GET,
+                "/wp-admin/install.php",
+                uri.query(),
+                None,
+                None,
+                None,
+                200,
+                0,
+            )
+            .await?;
+            Ok(Html(WP_WELCOME_HTML).into_response())
+        }
+        Method::POST => {
+            let body_str = body_to_string(&body);
+            let (user, pass) = parsers::parse_install_form(&body_str);
+            // Base-ladder entry — the installer is a one-shot claim, not a
+            // repeated-guess surface, so no escalation by grant count here.
+            let tarpit_secs = state.settings.tarpit_delay(0);
+            let delay_ms = u32::try_from(tarpit_secs * 1000).unwrap_or(0);
+            log_event(
+                &state,
+                &headers,
+                &Method::POST,
+                "/wp-admin/install.php",
+                uri.query(),
+                Some(body_str.as_str()),
+                user.as_deref(),
+                pass.as_deref(),
+                200,
+                delay_ms,
+            )
+            .await?;
+            if recordable_claim(&user, &pass) {
+                let _ = sink::record_granted_credential(
+                    &state.pool,
+                    user.as_deref().unwrap_or_default(),
+                    pass.as_deref().unwrap_or_default(),
+                    &crate::headers::extract_source_ip(&headers),
+                    sink::ORIGIN_INSTALL,
+                )
+                .await;
+                tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
+                // A recordable claim is the "you're in" moment: session
+                // cookies + the one-shot bomb only for it — a garbage POST
+                // must not burn the IP's first-grant bomb.
+                let grants_before = crate::sticky::grant_count(&state.grant_tracker, &ip);
+                crate::sticky::increment_grants(&state.grant_tracker, &ip);
+                let mut resp = Html(wp_install_success_html(user.as_deref().unwrap_or_default()))
+                    .into_response();
+                crate::sticky::attach_wp_session(&mut resp, grants_before, &state.settings);
+                Ok(resp)
+            } else {
+                tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
+                Ok(Html(wp_install_success_html("")).into_response())
+            }
+        }
+        _ => Ok(StatusCode::METHOD_NOT_ALLOWED.into_response()),
+    }
+}
+
+/// `wp-admin/setup-config.php` — the DB-details wizard step that precedes the
+/// installer. Kits walking the full playbook submit throwaway DB credentials
+/// here; they're logged structured (kit defaults are an identifier), then the
+/// "All right, sparky!" interstitial funnels them into `install.php`.
+pub async fn wp_setup_config(
+    State(state): State<HoneypotState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    method: Method,
+    body: Bytes,
+) -> Result<Response, Error> {
+    match method {
+        Method::GET => {
+            log_event(
+                &state,
+                &headers,
+                &Method::GET,
+                "/wp-admin/setup-config.php",
+                uri.query(),
+                None,
+                None,
+                None,
+                200,
+                0,
+            )
+            .await?;
+            Ok(Html(WP_SETUP_CONFIG_HTML).into_response())
+        }
+        Method::POST => {
+            let body_str = body_to_string(&body);
+            let (user, pass) = parsers::parse_setup_config_form(&body_str);
+            let tarpit_secs = state.settings.tarpit_delay(0);
+            let delay_ms = u32::try_from(tarpit_secs * 1000).unwrap_or(0);
+            log_event(
+                &state,
+                &headers,
+                &Method::POST,
+                "/wp-admin/setup-config.php",
+                uri.query(),
+                Some(body_str.as_str()),
+                user.as_deref(),
+                pass.as_deref(),
+                200,
+                delay_ms,
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
+            Ok(Html(WP_SETUP_CONFIG_DONE_HTML).into_response())
+        }
+        _ => Ok(StatusCode::METHOD_NOT_ALLOWED.into_response()),
+    }
 }
 
 pub async fn wp_json_catch(
@@ -463,8 +588,14 @@ pub async fn env_honeytrap(
         crate::sticky::planted_credential(&ip, path, &state.settings.honeytoken_prefix);
     let env_content = build_env_file(variant, &credential);
 
-    let _ =
-        sink::record_granted_credential(&state.pool, variant.db_user, &credential, &ip_str).await;
+    let _ = sink::record_granted_credential(
+        &state.pool,
+        variant.db_user,
+        &credential,
+        &ip_str,
+        sink::ORIGIN_ENV,
+    )
+    .await;
 
     sink::log_event(
         &state,
@@ -510,6 +641,17 @@ pub async fn env_catch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recordable_claim_requires_both_fields_non_empty() {
+        let u = |s: &str| Some(s.to_owned());
+        assert!(recordable_claim(&u("admin"), &u("s3cret")));
+        assert!(!recordable_claim(&u("admin"), &Some(String::new())));
+        assert!(!recordable_claim(&Some(String::new()), &u("s3cret")));
+        assert!(!recordable_claim(&None, &u("s3cret")));
+        assert!(!recordable_claim(&u("admin"), &None));
+        assert!(!recordable_claim(&None, &None));
+    }
 
     #[test]
     fn env_variant_detection() {

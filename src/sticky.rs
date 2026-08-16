@@ -115,22 +115,21 @@ pub fn planted_credential(ip: &IpAddr, path: &str, prefix: &str) -> String {
     result
 }
 
-/// Build the fake WP login-success response: 302 redirect to `/wp-admin/` with
-/// `Set-Cookie: wordpress_logged_in_<hash>=...`. The cookie value carries a
-/// fake auth token that looks like a real WP session cookie to any scanner
-/// checking for the `wordpress_logged_in_*` pattern.
-pub fn fake_success_response(grants: u32, settings: &crate::config::Settings) -> Response {
+/// Attach the fake WP session cookies — and the first-grant cookie bomb —
+/// to an existing response. Shared by the login fake-success redirect and
+/// the installer-claim success page: both are "you're in" moments, and the
+/// kit's HTTP client hoards every cookie from that point on.
+pub fn attach_wp_session(resp: &mut Response, grants: u32, settings: &crate::config::Settings) {
     let expiry = fake_cookie_expiry();
     let token = fake_auth_token();
     let cookie_val = format!("admin%7C{expiry}%7C{token}");
-    let cookie_name = format!("wordpress_logged_in_{WP_COOKIE_HASH}");
-
-    let mut resp = (StatusCode::FOUND, [("Location", "/wp-admin/")]).into_response();
     let headers = resp.headers_mut();
     headers.append(
         SET_COOKIE,
-        HeaderValue::from_str(&format!("{cookie_name}={cookie_val}; path=/"))
-            .expect("valid cookie"),
+        HeaderValue::from_str(&format!(
+            "wordpress_logged_in_{WP_COOKIE_HASH}={cookie_val}; path=/"
+        ))
+        .expect("valid cookie"),
     );
     headers.append(
         SET_COOKIE,
@@ -148,6 +147,13 @@ pub fn fake_success_response(grants: u32, settings: &crate::config::Settings) ->
             );
         }
     }
+}
+
+/// Build the fake WP login-success response: 302 redirect to `/wp-admin/`
+/// with WP session cookies (see [`attach_wp_session`]).
+pub fn fake_success_response(grants: u32, settings: &crate::config::Settings) -> Response {
+    let mut resp = (StatusCode::FOUND, [("Location", "/wp-admin/")]).into_response();
+    attach_wp_session(&mut resp, grants, settings);
     resp
 }
 

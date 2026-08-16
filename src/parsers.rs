@@ -45,6 +45,31 @@ pub(crate) fn extract_form_field(body: &str, field: &str) -> Option<String> {
     None
 }
 
+/// Parse the admin credentials an installer-claim kit chose on the
+/// `install.php?step=2` form. Primary names match WordPress core exactly;
+/// the fallbacks (`admin_user`, `log`/`pwd`) cover kits that reuse the
+/// wp-login field names when auto-filling the installer.
+pub(crate) fn parse_install_form(body: &str) -> (Option<String>, Option<String>) {
+    let field = |name: &str| extract_form_field(body, name).filter(|s| !s.is_empty());
+    let user = field("user_name")
+        .or_else(|| field("admin_user"))
+        .or_else(|| field("log"));
+    let pass = field("admin_password")
+        .or_else(|| field("admin_password2"))
+        .or_else(|| field("pwd"));
+    (user, pass)
+}
+
+/// Parse the database credentials from a `setup-config.php` wizard POST.
+/// Kits usually submit throwaway values, but they're logged structured
+/// regardless — the (uname, pwd) pair identifies kit defaults.
+pub(crate) fn parse_setup_config_form(body: &str) -> (Option<String>, Option<String>) {
+    (
+        extract_form_field(body, "uname"),
+        extract_form_field(body, "pwd"),
+    )
+}
+
 /// Extract (user, pass) from an XML-RPC body. Across all common attack
 /// patterns — direct `wp.getUsersBlogs`, `system.multicall` wrapping it, and
 /// `wp.getOptions` — the credentials are the LAST two `<string>` values
@@ -145,6 +170,57 @@ mod tests {
         let body = "log=user&pwd=pass+word";
         let (_, pass) = parse_form_creds(body);
         assert_eq!(pass.as_deref(), Some("pass word"));
+    }
+
+    #[test]
+    fn parses_install_form_core_field_names() {
+        let body = "weblog_title=My+Blog&user_name=k1tt3n_l0rd&admin_password=S3cr3t!\
+                    &admin_password2=S3cr3t!&pw_weak=1&admin_email=bad%40example.ru\
+                    &blog_public=0&language=en_US&Submit=Install+WordPress";
+        let (user, pass) = parse_install_form(body);
+        assert_eq!(user.as_deref(), Some("k1tt3n_l0rd"));
+        assert_eq!(pass.as_deref(), Some("S3cr3t!"));
+    }
+
+    #[test]
+    fn install_form_falls_back_to_confirm_field() {
+        // A kit that fills only admin_password2 still yields the password.
+        let body = "weblog_title=&user_name=admin&admin_password2=p%40ssw0rd";
+        let (user, pass) = parse_install_form(body);
+        assert_eq!(user.as_deref(), Some("admin"));
+        assert_eq!(pass.as_deref(), Some("p@ssw0rd"));
+    }
+
+    #[test]
+    fn install_form_skips_empty_primary_fields() {
+        // An empty admin_password must not shadow a filled confirm field.
+        let body = "user_name=admin&admin_password=&admin_password2=fallback";
+        let (user, pass) = parse_install_form(body);
+        assert_eq!(user.as_deref(), Some("admin"));
+        assert_eq!(pass.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn install_form_falls_back_to_login_field_names() {
+        let body = "log=admin&pwd=letmein&wp-submit=Install+WordPress";
+        let (user, pass) = parse_install_form(body);
+        assert_eq!(user.as_deref(), Some("admin"));
+        assert_eq!(pass.as_deref(), Some("letmein"));
+    }
+
+    #[test]
+    fn install_form_garbage_yields_none() {
+        let (user, pass) = parse_install_form("not a form at all");
+        assert_eq!(user, None);
+        assert_eq!(pass, None);
+    }
+
+    #[test]
+    fn parses_setup_config_db_credentials() {
+        let body = "dbname=wp_db&uname=dbadmin&pwd=db%24pass&dbhost=localhost&prefix=wp_";
+        let (user, pass) = parse_setup_config_form(body);
+        assert_eq!(user.as_deref(), Some("dbadmin"));
+        assert_eq!(pass.as_deref(), Some("db$pass"));
     }
 
     #[test]

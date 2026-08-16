@@ -22,6 +22,29 @@ use crate::HoneypotState;
 
 const MAX_CRED_LEN: usize = 1024;
 
+/// `granted_credentials.origin` values. Constants, not an enum, because the
+/// column is runtime-SQL TEXT; a typo here would silently degrade install
+/// pairs to the withheld (stuffer) treatment and break kit verification.
+pub(crate) const ORIGIN_LOGIN: &str = "login";
+pub(crate) const ORIGIN_ENV: &str = "env";
+pub(crate) const ORIGIN_INSTALL: &str = "install";
+
+/// Grant decision for a credential POST: install-origin pairs (site claimed
+/// via the fake installer) grant immediately — the kit's verification login
+/// must succeed or it flags the site as fake; other known pairs are withheld
+/// (churn for new passwords); a genuinely new pair grants only at the
+/// stuffer threshold.
+fn decide_grant(has_creds: bool, origin: Option<&str>, threshold_hit: bool) -> bool {
+    if !has_creds {
+        return false;
+    }
+    match origin {
+        Some(o) if o == ORIGIN_INSTALL => true,
+        Some(_) => false,
+        None => threshold_hit,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn log_event(
     state: &HoneypotState,
@@ -79,38 +102,48 @@ pub(crate) async fn log_event(
     Ok(())
 }
 
-pub(crate) async fn is_granted_credential(
+/// Origin of a row in `granted_credentials`. `Some(origin)` means the pair
+/// was seen before (origin = which trap recorded it first); `None` means the
+/// pair is new. Subsumes the old `is_granted_credential` boolean.
+pub(crate) async fn credential_origin(
     pool: &sqlx::PgPool,
     user: &str,
     pass: &str,
-) -> Result<bool, Error> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM granted_credentials WHERE username = $1 AND password = $2",
+) -> Result<Option<String>, Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT origin FROM granted_credentials WHERE username = $1 AND password = $2",
     )
-    .bind(user)
-    .bind(pass)
-    .fetch_one(pool)
+    .bind(truncate_to_boundary(user, MAX_CRED_LEN))
+    .bind(truncate_to_boundary(pass, MAX_CRED_LEN))
+    .fetch_optional(pool)
     .await?;
-    Ok(row.0 > 0)
+    Ok(row.map(|r| r.0))
 }
 
+/// Insert (or bump) a granted credential. `origin` is write-once in effect:
+/// the `ON CONFLICT` branch only increments `grant_count`, so the first trap
+/// to record a pair keeps its origin — that origin is the correlation anchor.
+/// Creds are truncated to `MAX_CRED_LEN` (same cap as `log_event`) so a
+/// multi-KB field can't bloat the table or trip Postgres's index-tuple limit.
 pub(crate) async fn record_granted_credential(
     pool: &sqlx::PgPool,
     user: &str,
     pass: &str,
     source_ip: &str,
+    origin: &str,
 ) -> Result<(), Error> {
     sqlx::query(
         r#"
-        INSERT INTO granted_credentials (username, password, first_granted_ip)
-        VALUES ($1, $2, $3)
+        INSERT INTO granted_credentials (username, password, first_granted_ip, origin)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (username, password) DO UPDATE
         SET grant_count = granted_credentials.grant_count + 1
         "#,
     )
-    .bind(user)
-    .bind(pass)
+    .bind(truncate_to_boundary(user, MAX_CRED_LEN))
+    .bind(truncate_to_boundary(pass, MAX_CRED_LEN))
     .bind(source_ip)
+    .bind(origin)
     .execute(pool)
     .await?;
     Ok(())
@@ -134,21 +167,20 @@ pub(crate) async fn trap_and_record(
         s.threshold_min,
         s.threshold_max,
     );
-    let granted = if threshold_hit {
-        match (&user, &pass) {
-            (Some(u), Some(p)) => {
-                if is_granted_credential(&state.pool, u, p).await? {
-                    false
-                } else {
-                    sticky::reset_counter(&state.honeypot_tracker, &ip);
-                    true
-                }
-            }
-            _ => false,
-        }
-    } else {
-        false
+    let origin = match (&user, &pass) {
+        (Some(u), Some(p)) => credential_origin(&state.pool, u, p).await?,
+        _ => None,
     };
+    let granted = decide_grant(
+        matches!((&user, &pass), (Some(u), Some(p)) if !u.is_empty() && !p.is_empty()),
+        origin.as_deref(),
+        threshold_hit,
+    );
+    // Only a genuinely new pair grants via the threshold; resetting on any
+    // other path would skip the next threshold cycle.
+    if granted && origin.is_none() {
+        sticky::reset_counter(&state.honeypot_tracker, &ip);
+    }
     let tarpit_secs = s.tarpit_delay(sticky::grant_count(&state.grant_tracker, &ip));
     let delay_ms = if granted {
         0
@@ -170,7 +202,10 @@ pub(crate) async fn trap_and_record(
     .await?;
     if granted {
         if let (Some(ref u), Some(ref p)) = (&user, &pass) {
-            let _ = record_granted_credential(&state.pool, u, p, &ip_str).await;
+            // ORIGIN_LOGIN is inert here for install-origin pairs: the ON
+            // CONFLICT branch never touches origin (write-once), so this only
+            // labels genuinely new pairs.
+            let _ = record_granted_credential(&state.pool, u, p, &ip_str, ORIGIN_LOGIN).await;
         }
         let grants_before = sticky::grant_count(&state.grant_tracker, &ip);
         sticky::increment_grants(&state.grant_tracker, &ip);
@@ -178,4 +213,29 @@ pub(crate) async fn trap_and_record(
     }
     tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
     Ok(Html(failure_html).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decide_grant_matrix() {
+        for (has_creds, origin, threshold, expected) in [
+            (true, Some(ORIGIN_INSTALL), false, true),
+            (true, Some(ORIGIN_INSTALL), true, true),
+            (true, Some(ORIGIN_LOGIN), true, false),
+            (true, Some(ORIGIN_ENV), true, false),
+            (true, None, true, true),
+            (true, None, false, false),
+            (false, Some(ORIGIN_INSTALL), true, false),
+            (false, None, true, false),
+        ] {
+            assert_eq!(
+                decide_grant(has_creds, origin, threshold),
+                expected,
+                "has_creds={has_creds}, origin={origin:?}, threshold={threshold}"
+            );
+        }
+    }
 }
