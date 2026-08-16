@@ -11,6 +11,18 @@ Each probing IP has a deterministic threshold (10-100, derived from `hash(ip + S
 
 Each IP contributes unique passwords. When one appears later from a different IP, you can correlate the attackers — even if they've rotated infrastructure.
 
+## Installer claim
+
+Bots race to complete WordPress's setup wizard on fresh installs — whoever finishes `install.php` first owns the site (they set the admin password, then upload a "plugin"). RustyPot mirrors the full wizard so installer-claim kits run their whole playbook against us:
+
+1. `GET /wp-admin/setup-config.php` → DB-details form (real field names: `dbname`, `uname`, `pwd`, `dbhost`, `prefix`)
+2. `POST setup-config.php?step=2` → DB creds logged, tarpit, "All right, sparky!" page linking the installer
+3. `GET /wp-admin/install.php` → the five-minute-install form (exact core field names: `user_name`, `admin_password`, ...)
+4. `POST install.php?step=2` → the kit's **chosen admin credentials** recorded with `origin='install'` in `granted_credentials`, tarpit, "Success!" page + WP session cookies (cookie bomb on the IP's first grant)
+5. The kit verifies by logging in at `/wp-login.php` — an `origin='install'` pair is granted **immediately** (no stuffer threshold), because a verification that fails would make the kit flag the site as fake
+
+`granted_credentials.origin` is write-once (`'login' | 'env' | 'install'`): the first trap to record a pair keeps its origin. Login/env-origin pairs keep the stuffer treatment (withheld grants, dictionary churn); install-origin pairs verify instantly. Bonus correlation: a stuffer IP that submits a *different* IP's claimed pair links the two actors.
+
 ## `.env` honeytoken
 
 `GET /.env` returns a realistic `.env` file containing a per-IP planted DB password (`fk` + 12 chars, deterministic from IP hash). The password is inserted into `granted_credentials`. If an attacker reads the `.env` and later submits that password at any login form, the submission is captured and matchable to the original probe — correlating the attacker across vectors.
@@ -29,7 +41,9 @@ Beyond passive capture, RustyPot actively wastes attacker resources:
 | Path | Method | Behavior |
 |---|---|---|
 | **Credential capture + threshold** | | |
-| `/wp-login.php` | any | GET: fake WP login form. POST: parse creds, tarpit, threshold/fingerprint |
+| `/wp-login.php` | any | GET: fake WP login form. POST: parse creds, tarpit, threshold/fingerprint (`origin='install'` pairs grant immediately) |
+| `/wp-admin/install.php` | any | GET: five-minute-install form. POST `?step=2`: capture chosen admin creds (`origin='install'`), tarpit, Success page + session cookies |
+| `/wp-admin/setup-config.php` | any | GET: DB-details form. POST `?step=2`: capture DB creds, tarpit, "All right, sparky!" → install.php |
 | `/xmlrpc.php` | POST | Parse XML-RPC creds, tarpit, return fault |
 | `/user/login` | any | Drupal login form + cred capture |
 | `/administrator/index.php` | any | Joomla admin login + cred capture |
@@ -138,7 +152,7 @@ ENABLED_TRAPS=wordpress,drupal,joomla,django
 See `migrations/`. Two tables:
 
 - `honeypot_event` — one row per request (source_ip, ua, method, path, query, post_body, submitted creds, response status, tarpit delay)
-- `granted_credentials` — fingerprint registry (username, password, first-granted IP, grant count)
+- `granted_credentials` — fingerprint registry (username, password, first-granted IP, grant count, origin: `'login' | 'env' | 'install'`)
 
 Optional: `ip_enrichment` table for cloud-provider / country / ASN lookups (enrichment script in the repo).
 
