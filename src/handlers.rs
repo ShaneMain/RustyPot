@@ -25,8 +25,9 @@ use crate::HoneypotState;
 use parsers::{body_to_string, parse_form_creds, parse_xmlrpc_creds};
 use sink::log_event;
 use templates::{
-    wp_install_success_html, WP_LOGIN_FORM_ERROR_HTML, WP_LOGIN_FORM_HTML,
-    WP_SETUP_CONFIG_DONE_HTML, WP_SETUP_CONFIG_HTML, WP_WELCOME_HTML, XMLRPC_FAULT_BODY,
+    plugin_readme_txt, wp_install_success_html, WP_LOGIN_FORM_ERROR_HTML, WP_LOGIN_FORM_HTML,
+    WP_SETUP_CONFIG_DONE_HTML, WP_SETUP_CONFIG_HTML, WP_VERSION_PHP, WP_WELCOME_HTML,
+    XMLRPC_FAULT_BODY,
 };
 
 /// Bound on the `post_body` column — matches the migration's 4 KiB design
@@ -381,6 +382,33 @@ pub async fn config_probe(
     if is_env_variant(uri.path()) {
         return env_honeytrap(State(state), OriginalUri(uri), headers, method).await;
     }
+    // Version/plugin fingerprinting gets a plausible answer rather than a 404.
+    // A scanner that reads an outdated `Stable tag:` or `$wp_version` escalates
+    // to an exploit attempt, and the exploit is the capture we actually want —
+    // a 404 ends the conversation with nothing recorded but the probe itself.
+    if let Some(bait) = fingerprint_bait(uri.path()) {
+        log_event(
+            &state,
+            &headers,
+            &method,
+            uri.path(),
+            uri.query(),
+            None,
+            None,
+            None,
+            200,
+            0,
+        )
+        .await?;
+        return Ok((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            bait,
+        )
+            .into_response());
+    }
     log_event(
         &state,
         &headers,
@@ -395,6 +423,28 @@ pub async fn config_probe(
     )
     .await?;
     Ok(StatusCode::NOT_FOUND.into_response())
+}
+
+/// Body for the two fingerprinting probes worth answering: WordPress core's
+/// `version.php` (served raw by hosts with a broken PHP handler) and any
+/// plugin `readme.txt`. `None` means "no bait for this path" — 404 as before.
+pub(crate) fn fingerprint_bait(path: &str) -> Option<String> {
+    let lower = path.to_ascii_lowercase();
+    if lower == "/wp-includes/version.php" {
+        return Some(WP_VERSION_PHP.to_owned());
+    }
+    let rest = lower.strip_prefix("/wp-content/plugins/")?;
+    let (slug, file) = rest.split_once('/')?;
+    if file != "readme.txt" || slug.is_empty() {
+        return None;
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(plugin_readme_txt(slug))
 }
 
 pub async fn php_probe(
@@ -634,9 +684,36 @@ pub async fn env_catch(
     method: Method,
 ) -> Result<Response, Error> {
     if !is_env_variant(uri.path()) {
-        return Ok(StatusCode::NOT_FOUND.into_response());
+        return unrouted_probe(State(state), OriginalUri(uri), headers, method).await;
     }
     env_honeytrap(State(state), OriginalUri(uri), headers, method).await
+}
+
+/// Terminal 404 for anything the edge routed here that no trap family claimed
+/// (`/wp-config.php`, `/phpinfo`, a bare `/administrator/`, a method no route
+/// accepts). It records first: these probes are the feed for deciding which
+/// trap to build next, and dropping them made the honeypot blind to exactly
+/// the paths it does not yet cover.
+pub async fn unrouted_probe(
+    State(state): State<HoneypotState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    method: Method,
+) -> Result<Response, Error> {
+    log_event(
+        &state,
+        &headers,
+        &method,
+        uri.path(),
+        uri.query(),
+        None,
+        None,
+        None,
+        404,
+        0,
+    )
+    .await?;
+    Ok(StatusCode::NOT_FOUND.into_response())
 }
 #[cfg(test)]
 mod tests {
@@ -651,6 +728,32 @@ mod tests {
         assert!(!recordable_claim(&None, &u("s3cret")));
         assert!(!recordable_claim(&u("admin"), &None));
         assert!(!recordable_claim(&None, &None));
+    }
+
+    #[test]
+    fn fingerprint_bait_answers_version_and_plugin_readmes() {
+        let v = fingerprint_bait("/wp-includes/version.php").expect("version bait");
+        assert!(v.contains("$wp_version = '5.8.1'"));
+        // case-insensitive: scanners probe /WP-includes/Version.php too
+        assert!(fingerprint_bait("/WP-Includes/VERSION.PHP").is_some());
+
+        let r = fingerprint_bait("/wp-content/plugins/wp-fastest-cache/readme.txt")
+            .expect("readme bait");
+        assert!(r.contains("=== Wp Fastest Cache ==="));
+        assert!(r.contains("Stable tag: 1.2.3"));
+    }
+
+    #[test]
+    fn fingerprint_bait_declines_everything_else() {
+        // not a readme, and not a plugin path at all
+        assert!(fingerprint_bait("/wp-content/plugins/foo/foo.php").is_none());
+        assert!(fingerprint_bait("/wp-includes/css/buttons.css").is_none());
+        assert!(fingerprint_bait("/wp-content/uploads/readme.txt").is_none());
+        // traversal / injection in the slug must not reach the template
+        assert!(fingerprint_bait("/wp-content/plugins/../../readme.txt").is_none());
+        assert!(fingerprint_bait("/wp-content/plugins/<script>/readme.txt").is_none());
+        // bare prefix, no slug
+        assert!(fingerprint_bait("/wp-content/plugins/readme.txt").is_none());
     }
 
     #[test]

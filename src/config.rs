@@ -112,7 +112,7 @@ impl Default for Settings {
             tarpit_ladder: vec![30, 60, 120, 240],
             threshold_min: 10,
             threshold_max: 100,
-            rate_limit_per_minute: 10,
+            rate_limit_per_minute: 240,
             honeytoken_prefix: "fk".to_owned(),
             cookie_bomb_count: 20,
             cookie_bomb_size: 400,

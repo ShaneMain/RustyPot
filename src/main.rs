@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
@@ -55,12 +55,44 @@ impl From<sqlx::Error> for Error {
     }
 }
 
+/// Abuse valve, not a scanner filter. Two rules matter here:
+///
+/// 1. **Always record.** The original version short-circuited before the
+///    handlers, so a burst sweep — the single most interesting thing a scanner
+///    does — produced no rows at all and the dashboards under-reported it.
+/// 2. **Stay in character.** A `429` whose body is `rate limited` is not
+///    something WordPress can emit; it fingerprints the honeypot in one
+///    request. An overloaded WordPress serves the DB-connection error page.
 async fn limit_honeypot(State(state): State<HoneypotState>, req: Request, next: Next) -> Response {
     let ip = client_ip(req.headers());
-    match state.rate_limiter.check_key(&ip) {
-        Ok(()) => next.run(req).await,
-        Err(_) => (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response(),
+    if state.rate_limiter.check_key(&ip).is_ok() {
+        return next.run(req).await;
     }
+    let headers = req.headers().clone();
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    if let Err(e) = sink::log_event(
+        &state,
+        &headers,
+        &method,
+        uri.path(),
+        uri.query(),
+        None,
+        None,
+        None,
+        503,
+        0,
+    )
+    .await
+    {
+        let Error::Db(e) = e;
+        tracing::error!("failed to record over-quota probe: {e}");
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Html(templates::WP_DB_ERROR_HTML),
+    )
+        .into_response()
 }
 
 fn client_ip(headers: &axum::http::HeaderMap) -> IpAddr {
@@ -223,6 +255,12 @@ async fn main() {
         .merge(cred_routes)
         .merge(cms_routes)
         .merge(admin_routes)
+        // Unmatched path and unmatched method both used to answer straight out
+        // of axum (404 / 405) with no row written. Both are attacker signal —
+        // `GET /xmlrpc.php` and `/wp-config.php` are among the most probed
+        // requests on the internet — so route them at a handler that records.
+        .fallback(handlers::unrouted_probe)
+        .method_not_allowed_fallback(handlers::unrouted_probe)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             limit_honeypot,

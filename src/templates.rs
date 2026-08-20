@@ -233,6 +233,118 @@ pub(super) const XMLRPC_FAULT_BODY: &str = r#"<?xml version="1.0"?>
 <member><name>faultString</name><value><string>Incorrect username or password.</string></value></member>
 </struct></value></fault></methodResponse>"#;
 
+/// Served instead of a bare `429 Too Many Requests` when a client blows past
+/// the abuse quota. WordPress emits exactly this page when its DB is
+/// unreachable, so an overloaded-looking site stays in character; a 429 with
+/// the body "rate limited" is not something WordPress can produce and
+/// fingerprints the honeypot in one request.
+pub(super) const WP_DB_ERROR_HTML: &str = r#"<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"><head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<title>WordPress &rsaquo; Error</title>
+<style type="text/css">
+html{background:#f1f1f1;}body{background:#fff;color:#444;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:2em auto;padding:1em 2em;max-width:700px;box-shadow:0 1px 1px rgba(0,0,0,.04);}
+h1{border-bottom:1px solid #dadada;clear:both;color:#666;font-size:24px;margin:30px 0 0;padding:0 0 7px;}
+</style>
+</head><body id="error-page"><h1>Error establishing a database connection</h1>
+<p>This either means that the username and password information in your <code>wp-config.php</code> file is incorrect or that contact with the database server at <code>localhost</code> could not be established. This could mean your host&#8217;s database server is down.</p>
+</body></html>"#;
+
+/// `wp-includes/version.php` as served by a host whose PHP handler is broken —
+/// the raw source, which is exactly what a fingerprinting scanner hopes for.
+/// The version is deliberately an old, heavily-CVE'd release: a scanner that
+/// believes it, escalates, and an escalation is far better telemetry than the
+/// 404 this used to return.
+pub(super) const WP_VERSION_PHP: &str = r#"<?php
+/**
+ * WordPress Version
+ *
+ * Contains version information for the current WordPress release.
+ *
+ * @package WordPress
+ * @since 1.1.0
+ */
+
+/**
+ * The WordPress version string.
+ *
+ * @global string $wp_version
+ */
+$wp_version = '5.8.1';
+
+/**
+ * Holds the WordPress DB revision, increments when changes are made to the WordPress DB schema.
+ *
+ * @global int $wp_db_version
+ */
+$wp_db_version = 49752;
+
+/**
+ * Holds the TinyMCE version.
+ *
+ * @global string $tinymce_version
+ */
+$tinymce_version = '49110-20201110';
+
+/**
+ * Holds the required PHP version.
+ *
+ * @global string $required_php_version
+ */
+$required_php_version = '5.6.20';
+
+/**
+ * Holds the required MySQL version.
+ *
+ * @global string $required_mysql_version
+ */
+$required_mysql_version = '5.0';
+"#;
+
+/// A WordPress plugin `readme.txt` for an arbitrary slug. Scanners fingerprint
+/// installed plugins by fetching this file and parsing `Stable tag:` — serving
+/// a plausible, outdated tag converts a dead-end 404 probe into an exploit
+/// attempt we can capture on the `/wp-content/` and `/wp-admin/` routes.
+pub(super) fn plugin_readme_txt(slug: &str) -> String {
+    let name = pretty_slug(slug);
+    format!(
+        "=== {name} ===\n\
+         Contributors: {slug}\n\
+         Tags: {slug}, wordpress, admin\n\
+         Requires at least: 4.7\n\
+         Tested up to: 5.8\n\
+         Requires PHP: 5.6\n\
+         Stable tag: 1.2.3\n\
+         License: GPLv2 or later\n\
+         License URI: https://www.gnu.org/licenses/gpl-2.0.html\n\n\
+         {name} for WordPress.\n\n\
+         == Description ==\n\n\
+         {name} adds administration features to your WordPress site.\n\n\
+         == Installation ==\n\n\
+         1. Upload the plugin files to `/wp-content/plugins/{slug}`.\n\
+         2. Activate the plugin through the 'Plugins' screen in WordPress.\n\n\
+         == Changelog ==\n\n\
+         = 1.2.3 =\n* Maintenance release.\n\n\
+         = 1.2.2 =\n* Fixed a compatibility issue.\n\n\
+         = 1.2.1 =\n* Initial public release.\n"
+    )
+}
+
+/// `bookingpress-appointment-booking` -> `Bookingpress Appointment Booking`.
+fn pretty_slug(slug: &str) -> String {
+    slug.split(['-', '_'])
+        .filter(|s| !s.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

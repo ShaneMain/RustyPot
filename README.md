@@ -63,8 +63,21 @@ Beyond passive capture, RustyPot actively wastes attacker resources:
 | `/composer.json` `/package.json` | GET | Dependency file probes |
 | `/phpinfo.php` `/shell.php` `/c99.php` `/r57.php` `/webshell.php` `/index.php` | any | PHP shell probes |
 | `/phpmyadmin/*` `/phpMyAdmin/*` `/pma/*` `/dbadmin/*` `/mysql/*` `/sqlmanager/*` `/adminer.php` | any | DB admin variants |
+| **Fingerprint bait** | | |
+| `/wp-includes/version.php` | any | Raw core `version.php` naming an outdated `$wp_version` |
+| `/wp-content/plugins/{slug}/readme.txt` | any | Plugin readme for any slug, with an outdated `Stable tag:` |
+| **Catch-all** | | |
+| anything else the edge routes here | any | Logged, then 404 — including method mismatches (`GET /xmlrpc.php`) |
 
-All routes are rate-limited (10 req/min/IP). Credential POSTs are body-limited to 4 KiB; admin capture routes allow 256 KiB for webshell uploads.
+Every request that reaches the service is recorded, including ones it answers
+with 404 or 503 — the paths RustyPot does *not* yet trap are the feed for
+deciding which trap to build next, so they must not be dropped silently.
+
+All routes are rate-limited (240 req/min/IP) as an abuse valve only: over-quota
+requests are still recorded, and are answered with WordPress's "Error
+establishing a database connection" page rather than a `429`, which no real
+WordPress emits. Credential POSTs are body-limited to 4 KiB; admin capture
+routes allow 256 KiB for webshell uploads.
 
 ## Deploy
 
@@ -106,7 +119,7 @@ Deploy `cloudflare-worker.js` via Wrangler. Exploit-path prefixes route to Rusty
 | `ENABLED_TRAPS` | no | `all` | Comma-separated trap families to enable. See below. |
 | `TARPIT_ESCALATION` | no | `30,60,120,240` | Comma-separated tarpit ladder (seconds). Nth value applies after Nth grant; last value repeats. Cap 3600s/entry — keep below your platform's request timeout. |
 | `THRESHOLD_MIN` / `THRESHOLD_MAX` | no | `10` / `100` | Per-IP grant threshold range. Swapped automatically if min > max. |
-| `RATE_LIMIT_PER_MINUTE` | no | `10` | Per-IP rate limit across all honeypot routes. |
+| `RATE_LIMIT_PER_MINUTE` | no | `240` | Per-IP abuse valve across all honeypot routes. Over-quota requests are still logged and answered with the WP database-error page. |
 | `HONEYTOKEN_PREFIX` | no | `fk` | 1-8 alphanumeric chars prefixing planted credentials. |
 | `COOKIE_BOMB_COUNT` | no | `20` | Cookies set on first grant. `0` disables the bomb. |
 | `COOKIE_BOMB_SIZE` | no | `400` | Bytes per bomb cookie. |
