@@ -65,13 +65,26 @@ Beyond passive capture, RustyPot actively wastes attacker resources:
 | `/phpmyadmin/*` `/phpMyAdmin/*` `/pma/*` `/dbadmin/*` `/mysql/*` `/sqlmanager/*` `/adminer.php` | any | DB admin variants |
 | **Fingerprint bait** | | |
 | `/wp-includes/version.php` | any | Raw core `version.php` naming an outdated `$wp_version` |
-| `/wp-content/plugins/{slug}/readme.txt` | any | Plugin readme for any slug, with an outdated `Stable tag:` |
+| `/readme.html` | any | Core readme naming the same version |
+| `/wp-content/plugins/{slug}/readme.txt` | any | Plugin readme with an outdated `Stable tag:` — a real name and a known-vulnerable version for ~35 catalogued slugs, a conservative default for the rest |
+| `/wp-content/themes/{slug}/style.css` | any | Theme header with an outdated `Version:` |
 | **Catch-all** | | |
 | anything else the edge routes here | any | Logged, then 404 — including method mismatches (`GET /xmlrpc.php`) |
 
 Every request that reaches the service is recorded, including ones it answers
 with 404 or 503 — the paths RustyPot does *not* yet trap are the feed for
 deciding which trap to build next, so they must not be dropped silently.
+
+The fingerprint bait exists because scanners read before they attack: the
+observed pattern is a bot confirming WordPress, reading the core version, then
+enumerating plugin `readme.txt` files, and leaving without an exploit attempt
+when those come back 404. A scanner compares `Stable tag:` against the affected
+range of whatever bug it knows, so `KNOWN_PLUGINS` in `templates.rs` names a
+version inside the publicly-known-vulnerable range for the plugins currently
+being exploited in the wild, biased low — being wrong about a patch boundary
+costs a missed escalation, never cover. Refresh that list as trends move; the
+dashboard's "Untrapped probes" and "Fingerprint bait" panels show which slugs
+are actually being asked for.
 
 All routes are rate-limited (240 req/min/IP) as an abuse valve only: over-quota
 requests are still recorded, and are answered with WordPress's "Error

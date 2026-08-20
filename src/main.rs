@@ -159,7 +159,10 @@ async fn main() {
             .route("/wp-json/", any(handlers::wp_json_catch))
             .route("/wp-json/{*rest}", any(handlers::wp_json_catch))
             .route("/wp-content/{*rest}", any(handlers::config_probe))
-            .route("/wp-includes/{*rest}", any(handlers::config_probe));
+            .route("/wp-includes/{*rest}", any(handlers::config_probe))
+            // Core's readme.html is the oldest WordPress version fingerprint
+            // there is; config_probe serves it from the same bait table.
+            .route("/readme.html", any(handlers::config_probe));
     }
     if cfg.is_enabled(TrapFamily::EnvHoneytoken) {
         cred_routes = cred_routes

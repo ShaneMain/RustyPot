@@ -301,12 +301,85 @@ $required_php_version = '5.6.20';
 $required_mysql_version = '5.0';
 "#;
 
-/// A WordPress plugin `readme.txt` for an arbitrary slug. Scanners fingerprint
-/// installed plugins by fetching this file and parsing `Stable tag:` — serving
-/// a plausible, outdated tag converts a dead-end 404 probe into an exploit
-/// attempt we can capture on the `/wp-content/` and `/wp-admin/` routes.
+/// Plugins worth naming a specific version for, because a scanner that reads
+/// this file does not stop at "installed" — it compares the `Stable tag:`
+/// against the affected range of whatever bug it knows about, and only
+/// escalates on a match. A generic version answers "installed" and ends the
+/// conversation; these answer "installed *and* exploitable".
+///
+/// Each version sits inside the publicly-known-vulnerable range for that
+/// plugin, biased deliberately *low*: an older tag is vulnerable to everything
+/// later advisories list, so being wrong about an exact patch boundary costs a
+/// missed escalation rather than a blown cover. The last group are ordinary
+/// popular plugins at plausible old versions — a site running only
+/// mass-exploited plugins and nothing else is not a credible site.
+///
+/// Refresh this list as exploitation trends move; the "Untrapped probes" and
+/// "Fingerprint bait" dashboard panels show which slugs are actually asked for.
+const KNOWN_PLUGINS: &[(&str, &str, &str)] = &[
+    // Heavily exploited: unauthenticated SQLi, RCE or privilege escalation.
+    ("wp-automatic", "WP Automatic", "3.92.0"),
+    ("bookingpress-appointment-booking", "BookingPress", "1.0.10"),
+    ("wp-fastest-cache", "WP Fastest Cache", "1.2.1"),
+    ("wp-file-manager", "WP File Manager", "6.8"),
+    ("duplicator", "Duplicator", "1.3.26"),
+    ("wpdiscuz", "wpDiscuz", "7.0.4"),
+    ("ultimate-member", "Ultimate Member", "2.6.6"),
+    (
+        "essential-addons-for-elementor-lite",
+        "Essential Addons for Elementor",
+        "5.7.1",
+    ),
+    ("litespeed-cache", "LiteSpeed Cache", "6.3.0.1"),
+    ("really-simple-ssl", "Really Simple SSL", "9.0.0"),
+    ("woocommerce-payments", "WooPayments", "5.6.1"),
+    ("contact-form-7", "Contact Form 7", "5.3.1"),
+    ("backup-backup", "Backup Migration", "1.3.6"),
+    ("tatsu", "Tatsu", "3.3.12"),
+    ("revslider", "Slider Revolution", "4.6.0"),
+    ("mstore-api", "MStore API", "3.9.2"),
+    ("forminator", "Forminator", "1.24.6"),
+    ("wp-google-maps", "WP Go Maps", "9.0.15"),
+    ("ninja-forms", "Ninja Forms", "3.6.10"),
+    ("profile-builder", "Profile Builder", "3.9.0"),
+    ("wp-user-avatar", "ProfilePress", "3.1.3"),
+    (
+        "beautiful-cookie-consent-banner",
+        "Beautiful Cookie Consent Banner",
+        "2.10.1",
+    ),
+    // Asked for by scanners we have already seen on this host.
+    ("gamipress", "GamiPress", "6.6.0"),
+    ("userswp", "UsersWP", "1.2.3"),
+    ("wp-ticket", "WP Ticket", "5.0.4"),
+    ("hellopress", "HelloPress", "1.0.0"),
+    // Ordinary furniture, so the install reads as a real site.
+    ("akismet", "Akismet Anti-Spam", "4.1.9"),
+    ("wordpress-seo", "Yoast SEO", "16.7"),
+    ("woocommerce", "WooCommerce", "5.5.0"),
+    ("jetpack", "Jetpack", "9.8"),
+    ("elementor", "Elementor", "3.5.4"),
+    ("classic-editor", "Classic Editor", "1.6"),
+    ("wp-super-cache", "WP Super Cache", "1.7.1"),
+    ("all-in-one-wp-migration", "All-in-One WP Migration", "7.62"),
+    ("wp-statistics", "WP Statistics", "13.1.5"),
+];
+
+/// Version served for a plugin we have no entry for. Low enough to precede any
+/// advisory a scanner might hold, and stable per slug so repeat probes agree.
+const UNKNOWN_PLUGIN_VERSION: &str = "1.0.2";
+
+/// A WordPress plugin `readme.txt`. Scanners fingerprint installed plugins by
+/// fetching this file and parsing `Stable tag:` — serving a plausible,
+/// outdated tag converts a dead-end 404 probe into an exploit attempt we can
+/// capture on the `/wp-content/` and `/wp-admin/` routes.
 pub(super) fn plugin_readme_txt(slug: &str) -> String {
-    let name = pretty_slug(slug);
+    let (name, version) = KNOWN_PLUGINS
+        .iter()
+        .find(|(s, _, _)| *s == slug)
+        .map(|(_, n, v)| ((*n).to_owned(), *v))
+        .unwrap_or_else(|| (pretty_slug(slug), UNKNOWN_PLUGIN_VERSION));
+    let prev = previous_version(version);
     format!(
         "=== {name} ===\n\
          Contributors: {slug}\n\
@@ -314,21 +387,65 @@ pub(super) fn plugin_readme_txt(slug: &str) -> String {
          Requires at least: 4.7\n\
          Tested up to: 5.8\n\
          Requires PHP: 5.6\n\
-         Stable tag: 1.2.3\n\
+         Stable tag: {version}\n\
          License: GPLv2 or later\n\
          License URI: https://www.gnu.org/licenses/gpl-2.0.html\n\n\
          {name} for WordPress.\n\n\
          == Description ==\n\n\
-         {name} adds administration features to your WordPress site.\n\n\
+         {name} adds functionality to your WordPress site.\n\n\
          == Installation ==\n\n\
          1. Upload the plugin files to `/wp-content/plugins/{slug}`.\n\
          2. Activate the plugin through the 'Plugins' screen in WordPress.\n\n\
          == Changelog ==\n\n\
-         = 1.2.3 =\n* Maintenance release.\n\n\
-         = 1.2.2 =\n* Fixed a compatibility issue.\n\n\
-         = 1.2.1 =\n* Initial public release.\n"
+         = {version} =\n* Maintenance release.\n\n\
+         = {prev} =\n* Fixed a compatibility issue.\n"
     )
 }
+
+/// A WordPress theme `style.css` header. Theme fingerprinting is the same probe
+/// as plugin fingerprinting with a different file, and reaches the honeypot on
+/// the existing `/wp-content/` route.
+pub(super) fn theme_style_css(slug: &str) -> String {
+    let name = pretty_slug(slug);
+    format!(
+        "/*\n\
+         Theme Name: {name}\n\
+         Theme URI: https://wordpress.org/themes/{slug}/\n\
+         Author: the WordPress team\n\
+         Description: {name} theme.\n\
+         Version: 1.4\n\
+         Requires at least: 4.7\n\
+         Tested up to: 5.8\n\
+         Requires PHP: 5.6\n\
+         License: GNU General Public License v2 or later\n\
+         Text Domain: {slug}\n\
+         */\n"
+    )
+}
+
+/// WordPress core's `readme.html`, the oldest and most-probed version
+/// fingerprint there is. Kept consistent with `WP_VERSION_PHP` — a scanner that
+/// reads 5.8.1 here and something else there learns it is being played with.
+pub(super) const WP_README_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width" />
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<title>WordPress &rsaquo; ReadMe</title>
+</head>
+<body>
+<h1 id="logo">WordPress</h1>
+<p style="text-align: center">Semantic Personal Publishing Platform</p>
+<h2>First Things First</h2>
+<p>Welcome. WordPress is a very special project to me.</p>
+<h2>Installation: Famous 5-minute install</h2>
+<ol>
+<li>Unzip the package in an empty directory and upload everything.</li>
+<li>Open <span class="file">wp-admin/install.php</span> in your browser.</li>
+</ol>
+<p>Version 5.8.1</p>
+</body>
+</html>"#;
 
 /// `bookingpress-appointment-booking` -> `Bookingpress Appointment Booking`.
 fn pretty_slug(slug: &str) -> String {
@@ -343,6 +460,19 @@ fn pretty_slug(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `1.2.1` -> `1.2.0`; anything that does not end in a number is returned with a
+/// `.0` suffix so the changelog still lists two entries.
+fn previous_version(version: &str) -> String {
+    match version.rsplit_once('.') {
+        Some((head, last)) => match last.parse::<u32>() {
+            Ok(0) => head.to_string(),
+            Ok(n) => format!("{head}.{}", n - 1),
+            Err(_) => format!("{version}.0"),
+        },
+        None => format!("{version}.0"),
+    }
 }
 
 #[cfg(test)]

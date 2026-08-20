@@ -12,7 +12,7 @@
  * patterns here too — paths routed here that RustyPot doesn't trap return 404.
  */
 
-const HONEYPOT_PREFIXES = /^\/(wp-|\.env|\.git|\.svn|\.hg|\.aws|\.ssh|xmlrpc|phpinfo|index\.php|shell\.php|c99\.php|r57\.php|webshell\.php|adminer\.php|user\/login|administrator|admin\/login|actuator|_ignition|pma|dbadmin|sqlmanager|phpmyadmin|phpMyAdmin|solr|server-status|server-info)/i;
+const HONEYPOT_PREFIXES = /^\/(wp-|\.env|\.git|\.svn|\.hg|\.aws|\.ssh|xmlrpc|phpinfo|readme\.html|index\.php|shell\.php|c99\.php|r57\.php|webshell\.php|adminer\.php|user\/login|administrator|admin\/login|actuator|_ignition|pma|dbadmin|sqlmanager|phpmyadmin|phpMyAdmin|solr|server-status|server-info)/i;
 
 // Subdirectory sweeps: /core/.env, /web/.env.dev, /.envrc anywhere in the path,
 // plus non-dotfile env names like /config.env. Matches the server-side rule in
