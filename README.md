@@ -218,7 +218,16 @@ gcloud run deploy rustypot \
 <details>
 <summary>Cloudflare Worker (edge routing)</summary>
 
-Deploy `cloudflare-worker.js` via Wrangler. Exploit-path prefixes route to RustyPot; everything else passes through to your app. Set `HONEYPOT_BACKEND` and `APP_BACKEND` as Worker secrets.
+Deploy `cloudflare-worker.js` via Wrangler on a fresh setup. Exploit-path prefixes route to RustyPot; everything else passes through to your app. Set `HONEYPOT_BACKEND` and `APP_BACKEND` as Worker secrets.
+
+**Updating an already-deployed Worker: use `./deploy-worker.sh`, not `wrangler deploy`.** This Worker routes *all* traffic for the zone, the real app included. Wrangler reconciles the whole Worker against `wrangler.toml`, so anything that file omits — the route binding, `HONEYPOT_BACKEND`, `APP_BACKEND` — it may rewrite or drop, and losing either backend binding returns 500 for every request to the site, not just the honeypot. The script uses the script-upload API with `keep_bindings`, which replaces the code and leaves routes and secrets untouched.
+
+```
+CF_API_TOKEN=…                     ./deploy-worker.sh   # lists script names
+CF_API_TOKEN=… WORKER_NAME=fk-edge ./deploy-worker.sh   # deploys
+```
+
+The token needs **Account > Workers Scripts > Edit** and nothing else.
 </details>
 
 ## Configuration
