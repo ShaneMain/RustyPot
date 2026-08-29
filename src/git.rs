@@ -1,5 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
+use std::time::Duration;
 
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -56,6 +58,18 @@ pub async fn git_honeytrap(
     method: Method,
 ) -> Result<Response, Error> {
     let path = uri.path();
+
+    // Same recon ladder as the .env trap: the infinite object chain only wastes
+    // an attacker's time if each link also costs them wall-clock. Indexed by
+    // the IP's sweep depth so the escalation compounds across both families.
+    let ip: IpAddr = crate::headers::extract_source_ip(&headers)
+        .parse()
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    let sweep = crate::sticky::record_recon_hit(&state.recon_tracker, &ip);
+    let desired_secs = state.settings.recon_tarpit_delay(sweep);
+    let permit = crate::tarpit::try_reserve(&state.slow_budget);
+    let delay_secs = crate::tarpit::effective_delay(desired_secs, &permit);
+
     sink::log_event(
         &state,
         &headers,
@@ -66,9 +80,14 @@ pub async fn git_honeytrap(
         None,
         None,
         200,
-        0,
+        u32::try_from(delay_secs * 1000).unwrap_or(0),
     )
     .await?;
+
+    if delay_secs > 0 {
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+    }
+    drop(permit);
 
     if path.ends_with(".pack") || path.ends_with(".idx") {
         let mut data = vec![b'P', b'A', b'C', b'K', 0, 0, 0, 2];

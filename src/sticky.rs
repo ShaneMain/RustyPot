@@ -26,6 +26,9 @@ const WP_COOKIE_HASH: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
 pub type AttemptTracker = Mutex<HashMap<IpAddr, u32>>;
 pub type GrantTracker = Mutex<HashMap<IpAddr, u32>>;
+/// Per-IP count of recon-trap hits (`.env`, `.git`). Drives the recon tarpit
+/// ladder: the more of the sweep an IP has burned through, the slower we get.
+pub type ReconTracker = Mutex<HashMap<IpAddr, u32>>;
 
 pub fn new_tracker() -> AttemptTracker {
     Mutex::new(HashMap::new())
@@ -33,6 +36,19 @@ pub fn new_tracker() -> AttemptTracker {
 
 pub fn new_grant_tracker() -> GrantTracker {
     Mutex::new(HashMap::new())
+}
+
+pub fn new_recon_tracker() -> ReconTracker {
+    Mutex::new(HashMap::new())
+}
+
+/// Count this recon hit and return the IP's running total (saturating). The
+/// returned value is the sweep depth used to index the recon tarpit ladder.
+pub fn record_recon_hit(tracker: &ReconTracker, ip: &IpAddr) -> u32 {
+    let mut map = tracker.lock().expect("recon tracker poisoned");
+    let count = map.entry(*ip).or_insert(0);
+    *count = count.saturating_add(1);
+    *count
 }
 
 pub fn grant_count(tracker: &GrantTracker, ip: &IpAddr) -> u32 {
@@ -88,6 +104,51 @@ pub fn reset_counter(tracker: &AttemptTracker, ip: &IpAddr) {
     if let Some(count) = map.get_mut(ip) {
         *count = 0;
     }
+}
+
+/// The honeytoken prefix to use for this request. Actors impersonating an AI
+/// crawler get a distinct prefix, so a credential presented back to us — or
+/// found in a dump elsewhere — identifies the tooling that harvested it
+/// without needing to join back to the request log.
+pub fn honeytoken_prefix(base: &str, headers: &axum::http::HeaderMap, path: &str) -> String {
+    if crate::headers::is_impersonating_crawler(headers, path) {
+        format!("{base}x")
+    } else {
+        base.to_owned()
+    }
+}
+
+/// `len` deterministic characters from `alphabet`, derived from (ip, seed).
+///
+/// `planted_credential` fixes its output at 12 characters, which is fine for a
+/// password but too short for callers that need more — an AWS key id needs 16,
+/// a phpass hash 30. Taking 12 and padding leaves a constant tail that is
+/// identical across every IP, and an attacker collecting several planted keys
+/// would see it immediately. This re-hashes as it goes, so the whole length
+/// carries entropy.
+pub fn derived_chars(ip: &IpAddr, seed: &str, alphabet: &[u8], len: usize) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut out = String::with_capacity(len);
+    let mut round: u64 = 0;
+    while out.len() < len {
+        let mut hasher = DefaultHasher::new();
+        ip.hash(&mut hasher);
+        hasher.write(STICKY_SALT);
+        hasher.write(seed.as_bytes());
+        hasher.write(&round.to_le_bytes());
+        let mut h = hasher.finish();
+        // 10 characters per hash round, then re-hash with a fresh counter.
+        for _ in 0..10 {
+            if out.len() == len {
+                break;
+            }
+            out.push(alphabet[(h % alphabet.len() as u64) as usize] as char);
+            h = h.rotate_right(5).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        }
+        round += 1;
+    }
+    out
 }
 
 /// Generate a planted credential for the `.env` honeytoken, unique per
@@ -195,6 +256,49 @@ mod tests {
                 "threshold {t} for {ip} not in [{min}, {max}]"
             );
         }
+    }
+
+    #[test]
+    fn derived_chars_fills_the_whole_length_with_entropy() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let alpha = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let a = derived_chars(&ip, "seed", alpha, 16);
+        assert_eq!(a.len(), 16);
+        assert_eq!(a, derived_chars(&ip, "seed", alpha, 16), "deterministic");
+
+        // The regression this guards: a constant tail shared by every IP.
+        let b: IpAddr = "198.51.100.9".parse().unwrap();
+        let other = derived_chars(&b, "seed", alpha, 16);
+        assert_ne!(a[10..], other[10..], "tail must vary across IPs");
+
+        // Long outputs must not repeat their first block.
+        let long = derived_chars(&ip, "seed", alpha, 30);
+        assert_eq!(long.len(), 30);
+        assert_ne!(&long[0..10], &long[10..20], "no period-10 repetition");
+        assert_ne!(&long[10..20], &long[20..30]);
+    }
+
+    #[test]
+    fn derived_chars_stays_inside_the_alphabet() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let alpha = b"AB";
+        let out = derived_chars(&ip, "s", alpha, 40);
+        assert!(out.chars().all(|c| c == 'A' || c == 'B'));
+    }
+
+    #[test]
+    fn impersonators_get_a_distinct_honeytoken_prefix() {
+        use axum::http::HeaderMap;
+        let mut spoof = HeaderMap::new();
+        spoof.insert(
+            "user-agent",
+            "compatible; PerplexityBot/1.0".parse().unwrap(),
+        );
+        assert_eq!(honeytoken_prefix("fk", &spoof, "/.env"), "fkx");
+
+        let mut plain = HeaderMap::new();
+        plain.insert("user-agent", "curl/8.7.1".parse().unwrap());
+        assert_eq!(honeytoken_prefix("fk", &plain, "/.env"), "fk");
     }
 
     #[test]

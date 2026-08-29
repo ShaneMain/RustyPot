@@ -28,6 +28,14 @@ const MAX_CRED_LEN: usize = 1024;
 pub(crate) const ORIGIN_LOGIN: &str = "login";
 pub(crate) const ORIGIN_ENV: &str = "env";
 pub(crate) const ORIGIN_INSTALL: &str = "install";
+/// Planted in a secret-bearing file other than `.env` (`.aws/credentials`,
+/// `.git-credentials`, CI config, ...). Same withheld treatment as `env`.
+pub(crate) const ORIGIN_SECRET: &str = "secret";
+/// Chosen by an attacker at `admin-ajax.php` — a backdoor account a plugin
+/// exploit tried to create. Verifies immediately for the same reason
+/// `install` does: the kit checks its own work, and a failed check tells it
+/// the site is fake.
+pub(crate) const ORIGIN_AJAX: &str = "ajax";
 
 /// Grant decision for a credential POST: install-origin pairs (site claimed
 /// via the fake installer) grant immediately — the kit's verification login
@@ -39,12 +47,13 @@ fn decide_grant(has_creds: bool, origin: Option<&str>, threshold_hit: bool) -> b
         return false;
     }
     match origin {
-        Some(o) if o == ORIGIN_INSTALL => true,
+        Some(o) if o == ORIGIN_INSTALL || o == ORIGIN_AJAX => true,
         Some(_) => false,
         None => threshold_hit,
     }
 }
 
+/// Record an event where the credentials (if any) came FROM the attacker.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn log_event(
     state: &HoneypotState,
@@ -58,6 +67,79 @@ pub(crate) async fn log_event(
     response_status: u16,
     response_delay_ms: u32,
 ) -> Result<(), Error> {
+    log_event_inner(
+        state,
+        headers,
+        method,
+        path,
+        query,
+        post_body,
+        Creds {
+            submitted: (submitted_user, submitted_pass),
+            planted: (None, None),
+        },
+        response_status,
+        response_delay_ms,
+    )
+    .await
+}
+
+/// Record an event where WE planted the credential (the `.env` honeytoken).
+///
+/// The plant goes to `planted_*`, never `submitted_*`. Writing it to
+/// `submitted_*` — as this trap used to — makes the honeypot's own output
+/// indistinguishable from attacker input, which silently inflated every
+/// credential-capture metric by roughly 4x.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn log_planted_event(
+    state: &HoneypotState,
+    headers: &HeaderMap,
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+    planted_user: Option<&str>,
+    planted_pass: Option<&str>,
+    response_status: u16,
+    response_delay_ms: u32,
+) -> Result<(), Error> {
+    log_event_inner(
+        state,
+        headers,
+        method,
+        path,
+        query,
+        None,
+        Creds {
+            submitted: (None, None),
+            planted: (planted_user, planted_pass),
+        },
+        response_status,
+        response_delay_ms,
+    )
+    .await
+}
+
+/// Attacker-supplied vs honeypot-planted credentials for one event. Grouped
+/// into a struct so the two pairs can never be passed in the wrong order.
+struct Creds<'a> {
+    submitted: (Option<&'a str>, Option<&'a str>),
+    planted: (Option<&'a str>, Option<&'a str>),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_event_inner(
+    state: &HoneypotState,
+    headers: &HeaderMap,
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+    post_body: Option<&str>,
+    creds: Creds<'_>,
+    response_status: u16,
+    response_delay_ms: u32,
+) -> Result<(), Error> {
+    let (submitted_user, submitted_pass) = creds.submitted;
+    let (planted_user, planted_pass) = creds.planted;
     let source_ip = extract_source_ip(headers);
     let via_cloudflare = headers.contains_key("cf-connecting-ip");
     let user_agent = header_str(headers, "user-agent").map(str::to_owned);
@@ -71,6 +153,8 @@ pub(crate) async fn log_event(
     let truncated_body = post_body.map(|b| truncate_to_boundary(b, MAX_POST_BODY_BYTES).to_owned());
     let user = submitted_user.map(|s| truncate_to_boundary(s, MAX_CRED_LEN).to_owned());
     let pass = submitted_pass.map(|s| truncate_to_boundary(s, MAX_CRED_LEN).to_owned());
+    let plant_user = planted_user.map(|s| truncate_to_boundary(s, MAX_CRED_LEN).to_owned());
+    let plant_pass = planted_pass.map(|s| truncate_to_boundary(s, MAX_CRED_LEN).to_owned());
 
     sqlx::query(
         r#"
@@ -78,8 +162,10 @@ pub(crate) async fn log_event(
             (source_ip, via_cloudflare, user_agent, method, path, query,
              post_body, submitted_user, submitted_pass, request_headers,
              response_status, response_delay_ms,
-             accept_language, cf_ipcountry, form_submit_text)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             accept_language, cf_ipcountry, form_submit_text,
+             planted_user, planted_pass)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                $16, $17)
         "#,
     )
     .bind(source_ip)
@@ -97,6 +183,8 @@ pub(crate) async fn log_event(
     .bind(accept_language)
     .bind(cf_ipcountry)
     .bind(submit_text)
+    .bind(plant_user)
+    .bind(plant_pass)
     .execute(&state.pool)
     .await?;
     Ok(())
@@ -181,12 +269,17 @@ pub(crate) async fn trap_and_record(
     if granted && origin.is_none() {
         sticky::reset_counter(&state.honeypot_tracker, &ip);
     }
-    let tarpit_secs = s.tarpit_delay(sticky::grant_count(&state.grant_tracker, &ip));
-    let delay_ms = if granted {
+    let desired_secs = s.tarpit_delay(sticky::grant_count(&state.grant_tracker, &ip));
+    // Reserve before logging so the recorded delay is the one actually served.
+    let permit = (!granted)
+        .then(|| crate::tarpit::try_reserve(&state.slow_budget))
+        .flatten();
+    let tarpit_secs = if granted {
         0
     } else {
-        u32::try_from(tarpit_secs * 1000).unwrap_or(0)
+        crate::tarpit::effective_delay(desired_secs, &permit)
     };
+    let delay_ms = u32::try_from(tarpit_secs * 1000).unwrap_or(0);
     log_event(
         state,
         headers,
@@ -211,7 +304,10 @@ pub(crate) async fn trap_and_record(
         sticky::increment_grants(&state.grant_tracker, &ip);
         return Ok(sticky::fake_success_response(grants_before, s));
     }
-    tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
+    if tarpit_secs > 0 {
+        tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
+    }
+    drop(permit);
     Ok(Html(failure_html).into_response())
 }
 
