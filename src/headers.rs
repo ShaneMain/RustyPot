@@ -25,6 +25,50 @@ pub(crate) fn extract_source_ip(headers: &HeaderMap) -> String {
     "0.0.0.0".to_owned()
 }
 
+/// User-agent substrings claimed by major AI crawlers.
+const CRAWLER_MARKERS: &[&str] = &[
+    "chatgpt-user",
+    "oai-searchbot",
+    "gptbot",
+    "perplexitybot",
+    "amazonbot",
+    "amzn-searchbot",
+    "cohere-ai",
+    "claudebot",
+    "google-extended",
+    "bingbot",
+];
+
+/// Paths no legitimate crawler ever requests: secret files, credential forms
+/// and exploit endpoints. A crawler-branded user-agent on one of these is
+/// forged — the branding is chosen because many sites allowlist those crawlers.
+fn is_never_crawled(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.contains(".env")
+        || p.contains("/.aws/")
+        || p.contains("/.ssh/")
+        || p.contains("/.git")
+        || p.contains("credentials")
+        || p.contains("admin-ajax")
+        || p.contains("xmlrpc")
+        || p.contains("wp-login")
+        || p.contains("/actuator/")
+}
+
+/// True when the client brands itself as an AI crawler while requesting
+/// something no crawler would. Used to give the actor its own honeytoken
+/// prefix, so a credential surfacing later carries "this actor impersonates
+/// AI crawlers" as a tooling fingerprint without needing a join.
+pub(crate) fn is_impersonating_crawler(headers: &HeaderMap, path: &str) -> bool {
+    if !is_never_crawled(path) {
+        return false;
+    }
+    header_str(headers, "user-agent").is_some_and(|ua| {
+        let lower = ua.to_ascii_lowercase();
+        CRAWLER_MARKERS.iter().any(|m| lower.contains(m))
+    })
+}
+
 pub(crate) fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
@@ -37,6 +81,11 @@ pub(crate) fn capture_headers(headers: &HeaderMap) -> Value {
         "true-client-ip",
         "accept-language",
         "referer",
+        // Cloudflare's geo tag. Forwarded explicitly by the Worker (it is not
+        // present on the origin request by default), and captured here so the
+        // raw value survives even if the cf_ipcountry column is ever dropped.
+        "cf-ipcountry",
+        "cf-ray",
     ] {
         if let Some(v) = header_str(headers, name) {
             map.insert(name.to_owned(), Value::String(v.to_owned()));
@@ -75,6 +124,40 @@ mod tests {
     fn defaults_to_zero_when_no_proxy_header() {
         let headers = HeaderMap::new();
         assert_eq!(extract_source_ip(&headers), "0.0.0.0");
+    }
+
+    #[test]
+    fn crawler_branding_on_a_secret_path_is_impersonation() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "user-agent",
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot"
+                .parse()
+                .unwrap(),
+        );
+        assert!(is_impersonating_crawler(&h, "/.env"));
+        assert!(is_impersonating_crawler(&h, "/.aws/credentials"));
+        assert!(is_impersonating_crawler(&h, "/wp-login.php"));
+    }
+
+    #[test]
+    fn crawler_branding_on_an_ordinary_path_is_not_flagged() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "user-agent",
+            "Mozilla/5.0 (compatible; Amazonbot/0.1)".parse().unwrap(),
+        );
+        // A real crawler may legitimately fetch these.
+        assert!(!is_impersonating_crawler(&h, "/readme.html"));
+        assert!(!is_impersonating_crawler(&h, "/index.php"));
+    }
+
+    #[test]
+    fn ordinary_user_agents_are_never_impersonators() {
+        let mut h = HeaderMap::new();
+        h.insert("user-agent", "curl/8.7.1".parse().unwrap());
+        assert!(!is_impersonating_crawler(&h, "/.env"));
+        assert!(!is_impersonating_crawler(&HeaderMap::new(), "/.env"));
     }
 
     #[test]

@@ -75,17 +75,97 @@ pub(crate) fn parse_setup_config_form(body: &str) -> (Option<String>, Option<Str
 /// `wp.getOptions` — the credentials are the LAST two `<string>` values
 /// (methodNames come first when present). With fewer than two `<string>`
 /// tags there is nothing credential-shaped to log.
-pub(crate) fn parse_xmlrpc_creds(body: &str) -> (Option<String>, Option<String>) {
-    let mut strings: Vec<&str> = Vec::new();
+/// Content of the first `<methodName>` element, if any.
+fn xmlrpc_method_name(body: &str) -> Option<&str> {
+    let start = body.find("<methodName>")? + "<methodName>".len();
+    let rest = &body[start..];
+    let end = rest.find("</methodName>")?;
+    Some(rest[..end].trim())
+}
+
+/// Every `<string>` value in `body`, in document order. When `skip_structs` is
+/// set, values nested inside a `<struct>` are omitted — that is where post
+/// payloads live, and they must not be mistaken for credentials.
+fn xmlrpc_strings(body: &str, skip_structs: bool) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
     let mut rest = body;
-    while let Some(start) = rest.find("<string>") {
-        rest = &rest[start + "<string>".len()..];
-        let Some(end) = rest.find("</string>") else {
+    let mut depth: u32 = 0;
+    loop {
+        // Advance to whichever comes first: a struct boundary or a string.
+        let next_open = rest.find("<struct>");
+        let next_close = rest.find("</struct>");
+        let next_str = rest.find("<string>");
+        let Some(pos) = [next_open, next_close, next_str]
+            .into_iter()
+            .flatten()
+            .min()
+        else {
             break;
         };
-        strings.push(&rest[..end]);
-        rest = &rest[end + "</string>".len()..];
+        if Some(pos) == next_open {
+            depth += 1;
+            rest = &rest[pos + "<struct>".len()..];
+        } else if Some(pos) == next_close {
+            depth = depth.saturating_sub(1);
+            rest = &rest[pos + "</struct>".len()..];
+        } else {
+            rest = &rest[pos + "<string>".len()..];
+            let Some(end) = rest.find("</string>") else {
+                break;
+            };
+            if !skip_structs || depth == 0 {
+                out.push(&rest[..end]);
+            }
+            rest = &rest[end + "</string>".len()..];
+        }
     }
+    out
+}
+
+/// Value of a `<struct>` member by name, e.g. the `description` of a
+/// `metaWeblog.newPost` content struct.
+pub(crate) fn xmlrpc_struct_member(body: &str, member: &str) -> Option<String> {
+    let needle = format!("<name>{member}</name>");
+    let start = body.find(&needle)? + needle.len();
+    let rest = &body[start..];
+    // The value follows its name; stop at the next member so a missing
+    // <string> cannot borrow the following member's value.
+    let bound = rest.find("<name>").unwrap_or(rest.len());
+    let window = &rest[..bound];
+    let vs = window.find("<string>")? + "<string>".len();
+    let ve = window[vs..].find("</string>")?;
+    Some(window[vs..vs + ve].to_owned())
+}
+
+/// True for the XML-RPC methods that publish content. These are content
+/// injection, not authentication: the caller is checking whether the site will
+/// accept a post it can later find by searching the web for its canary.
+pub(crate) fn is_publishing_method(body: &str) -> bool {
+    xmlrpc_method_name(body).is_some_and(|m| {
+        m.starts_with("metaWeblog.new")
+            || m.starts_with("metaWeblog.edit")
+            || m.starts_with("blogger.new")
+            || m.starts_with("wp.newPost")
+            || m.starts_with("mt.")
+    })
+}
+
+/// Pull (username, password) out of an XML-RPC call.
+///
+/// WordPress puts credentials at different param positions per API, but they
+/// are always consecutive scalar params — never inside a `<struct>`. The naive
+/// "last two `<string>` values" rule works for auth-only calls like
+/// `wp.getUsersBlogs`, and for `system.multicall` (whose credentials are nested
+/// in the inner call). It breaks badly on the publishing APIs
+/// (`metaWeblog.newPost`, `mt.*`, `blogger.*`), where the post payload struct
+/// comes AFTER the credentials — there it captured the post title and body and
+/// filed them as a username and password.
+///
+/// So: multicall keeps the flat rule; everything else ignores struct contents
+/// first, which leaves the credentials as the trailing pair either way.
+pub(crate) fn parse_xmlrpc_creds(body: &str) -> (Option<String>, Option<String>) {
+    let skip_structs = xmlrpc_method_name(body) != Some("system.multicall");
+    let strings = xmlrpc_strings(body, skip_structs);
     if strings.len() < 2 {
         return (None, None);
     }
@@ -261,6 +341,56 @@ mod tests {
         let (user, pass) = parse_xmlrpc_creds(body);
         assert_eq!(user.as_deref(), Some("admin"));
         assert_eq!(pass.as_deref(), Some("password123"));
+    }
+
+    #[test]
+    fn xmlrpc_publish_call_reads_creds_not_post_payload() {
+        // metaWeblog.newPost: (blogid, username, password, content_struct,
+        // publish). Observed in the wild as an unauthenticated content-
+        // injection probe — the struct carries a canary the attacker later
+        // searches for. The naive last-two rule filed the canary as the
+        // credentials; the real username/password sit before the struct.
+        let body = r#"<?xml version="1.0"?><methodCall><methodName>metaWeblog.newPost</methodName><params><param><value><string>1</string></value></param><param><value><string>11623</string></value></param><param><value><string>sekrit</string></value></param><param><value><struct><member><name>title</name><value><string>0x377fe0d7</string></value></member><member><name>description</name><value><string>0x377fe0d7</string></value></member></struct></value></param><param><value><boolean>1</boolean></value></param></params></methodCall>"#;
+        let (user, pass) = parse_xmlrpc_creds(body);
+        assert_eq!(user.as_deref(), Some("11623"));
+        assert_eq!(pass.as_deref(), Some("sekrit"));
+    }
+
+    #[test]
+    fn xmlrpc_publish_call_without_creds_returns_none() {
+        // Struct-only payload: nothing outside it, so nothing to report.
+        let body = r#"<methodCall><methodName>metaWeblog.newPost</methodName><params><param><value><struct><member><name>title</name><value><string>spam</string></value></member></struct></value></param></params></methodCall>"#;
+        assert_eq!(parse_xmlrpc_creds(body), (None, None));
+    }
+
+    #[test]
+    fn reads_the_injected_canary_from_the_content_struct() {
+        let body = r#"<methodCall><methodName>metaWeblog.newPost</methodName><params><param><value><string>1</string></value></param><param><value><string>u</string></value></param><param><value><string>p</string></value></param><param><value><struct><member><name>title</name><value><string>0x377fe0d7</string></value></member><member><name>description</name><value><string>canary body</string></value></member></struct></value></param></params></methodCall>"#;
+        assert_eq!(
+            xmlrpc_struct_member(body, "title").as_deref(),
+            Some("0x377fe0d7")
+        );
+        assert_eq!(
+            xmlrpc_struct_member(body, "description").as_deref(),
+            Some("canary body")
+        );
+        assert_eq!(xmlrpc_struct_member(body, "absent"), None);
+    }
+
+    #[test]
+    fn publishing_methods_are_distinguished_from_auth_calls() {
+        assert!(is_publishing_method(
+            "<methodCall><methodName>metaWeblog.newPost</methodName></methodCall>"
+        ));
+        assert!(is_publishing_method(
+            "<methodCall><methodName>mt.getRecentPostTitles</methodName></methodCall>"
+        ));
+        assert!(!is_publishing_method(
+            "<methodCall><methodName>wp.getUsersBlogs</methodName></methodCall>"
+        ));
+        assert!(!is_publishing_method(
+            "<methodCall><methodName>system.multicall</methodName></methodCall>"
+        ));
     }
 
     #[test]

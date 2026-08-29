@@ -212,7 +212,7 @@ code{{background:#f0f0f1;padding:2px 6px;border-radius:3px;}}
 /// Minimal HTML escaping for interpolating attacker-controlled values into
 /// honeypot pages. The bytes come back to the attacker's own tooling, but
 /// escaped output keeps our responses inert regardless of what they submit.
-pub(super) fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

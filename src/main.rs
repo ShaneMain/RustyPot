@@ -10,15 +10,23 @@ use axum::Router;
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 use std::num::NonZeroU32;
 
+mod actuator;
+mod ajax;
+mod assets;
 mod canary;
 mod cms;
 mod config;
+mod facade;
 mod git;
 mod handlers;
 mod headers;
 mod parsers;
+mod php;
+mod restapi;
+mod secrets;
 mod sink;
 mod sticky;
+mod tarpit;
 mod templates;
 
 use config::{Settings, TrapConfig, TrapFamily};
@@ -31,6 +39,9 @@ pub struct HoneypotState {
     pub rate_limiter: Arc<IpRateLimiter>,
     pub honeypot_tracker: Arc<sticky::AttemptTracker>,
     pub grant_tracker: Arc<sticky::GrantTracker>,
+    pub recon_tracker: Arc<sticky::ReconTracker>,
+    pub canary_posts: Arc<canary::CanaryPosts>,
+    pub slow_budget: tarpit::Budget,
     pub settings: Arc<Settings>,
 }
 
@@ -144,13 +155,14 @@ async fn main() {
         rate_limiter,
         honeypot_tracker: Arc::new(sticky::new_tracker()),
         grant_tracker: Arc::new(sticky::new_grant_tracker()),
+        recon_tracker: Arc::new(sticky::new_recon_tracker()),
+        canary_posts: Arc::new(canary::new_canary_posts()),
+        slow_budget: tarpit::new_budget(settings.slow_response_budget),
         settings: settings.clone(),
     };
     let cfg = &trap_config;
 
-    let mut cred_routes = Router::new().layer(axum::extract::DefaultBodyLimit::max(
-        handlers::MAX_POST_BODY_BYTES,
-    ));
+    let mut cred_routes = Router::new();
 
     if cfg.is_enabled(TrapFamily::WordPress) {
         cred_routes = cred_routes
@@ -158,8 +170,12 @@ async fn main() {
             .route("/xmlrpc.php", post(handlers::xmlrpc))
             .route("/wp-json/", any(handlers::wp_json_catch))
             .route("/wp-json/{*rest}", any(handlers::wp_json_catch))
-            .route("/wp-content/{*rest}", any(handlers::config_probe))
-            .route("/wp-includes/{*rest}", any(handlers::config_probe))
+            .route("/wp-admin/admin-ajax.php", any(ajax::admin_ajax))
+            .route("/wp-content/{*rest}", any(ajax::plugin_endpoint))
+            // Core JS/CSS ahead of the probe handler: a real WordPress always
+            // serves these, and 404ing them told any bot that checked that the
+            // WordPress around them was fake.
+            .route("/wp-includes/{*rest}", any(assets::wp_static))
             // Core's readme.html is the oldest WordPress version fingerprint
             // there is; config_probe serves it from the same bait table.
             .route("/readme.html", any(handlers::config_probe));
@@ -183,12 +199,19 @@ async fn main() {
     }
     if cfg.is_enabled(TrapFamily::CloudKeys) {
         cred_routes = cred_routes
-            .route("/.aws/{*rest}", any(handlers::config_probe))
+            .route("/.aws/{*rest}", any(secrets::secret_honeytrap))
+            .route("/.git-credentials", any(secrets::secret_honeytrap))
+            .route("/.gitconfig", any(secrets::secret_honeytrap))
+            .route("/.gitlab-ci.yml", any(secrets::secret_honeytrap))
+            .route("/.npmrc", any(secrets::secret_honeytrap))
+            .route("/.docker/config.json", any(secrets::secret_honeytrap))
+            .route("/.github/workflows/{*rest}", any(secrets::secret_honeytrap))
             .route("/.ssh/{*rest}", any(handlers::config_probe));
     }
     if cfg.is_enabled(TrapFamily::FrameworkDebug) {
         cred_routes = cred_routes
-            .route("/actuator/{*rest}", any(handlers::config_probe))
+            .route("/actuator", any(actuator::actuator))
+            .route("/actuator/{*rest}", any(actuator::actuator))
             .route("/_ignition/{*rest}", any(handlers::config_probe));
     }
     if cfg.is_enabled(TrapFamily::ServiceExposure) {
@@ -202,7 +225,8 @@ async fn main() {
     }
     if cfg.is_enabled(TrapFamily::PhpShells) {
         cred_routes = cred_routes
-            .route("/phpinfo.php", any(handlers::php_probe))
+            .route("/phpinfo.php", any(php::phpinfo))
+            .route("/phpinfo", any(php::phpinfo))
             .route("/index.php", any(handlers::php_probe))
             .route("/shell.php", any(handlers::php_probe))
             .route("/c99.php", any(handlers::php_probe))
@@ -210,19 +234,32 @@ async fn main() {
             .route("/webshell.php", any(handlers::php_probe));
     }
     if cfg.is_enabled(TrapFamily::DbAdmin) {
-        cred_routes = cred_routes
-            .route("/phpmyadmin/{*rest}", any(handlers::config_probe))
-            .route("/phpMyAdmin/{*rest}", any(handlers::config_probe))
-            .route("/pma/{*rest}", any(handlers::config_probe))
-            .route("/dbadmin/{*rest}", any(handlers::config_probe))
-            .route("/mysql/{*rest}", any(handlers::config_probe))
-            .route("/sqlmanager/{*rest}", any(handlers::config_probe))
-            .route("/adminer.php", any(handlers::config_probe));
+        for prefix in [
+            "phpmyadmin",
+            "phpMyAdmin",
+            "phpmyadmin2",
+            "phpMyAdmin2",
+            "phpmyadmin-2",
+            "phpMyAdmin-2",
+            "phpmyadmin3",
+            "phpmyadmin4",
+            "PMA",
+            "pma",
+            "pmd",
+            "dbadmin",
+            "mysql",
+            "sqlmanager",
+            "myadmin",
+        ] {
+            cred_routes = cred_routes
+                .route(&format!("/{prefix}"), any(cms::cms_login))
+                .route(&format!("/{prefix}/"), any(cms::cms_login))
+                .route(&format!("/{prefix}/{{*rest}}"), any(cms::cms_login));
+        }
+        cred_routes = cred_routes.route("/adminer.php", any(cms::cms_login));
     }
 
-    let mut cms_routes = Router::new().layer(axum::extract::DefaultBodyLimit::max(
-        handlers::MAX_EXPLOIT_BODY_BYTES,
-    ));
+    let mut cms_routes = Router::new();
     if cfg.is_enabled(TrapFamily::Drupal) {
         cms_routes = cms_routes.route("/user/login", any(cms::cms_login));
     }
@@ -241,23 +278,37 @@ async fn main() {
             .route("/admin/{*rest}", any(handlers::post_exploit_capture));
     }
 
-    let mut admin_routes = Router::new().layer(axum::extract::DefaultBodyLimit::max(
-        handlers::MAX_EXPLOIT_BODY_BYTES,
-    ));
+    let mut admin_routes = Router::new();
     if cfg.is_enabled(TrapFamily::WordPress) {
         admin_routes = admin_routes
             .route("/wp-admin/install.php", any(handlers::wp_admin_install))
             .route("/wp-admin/setup-config.php", any(handlers::wp_setup_config))
             .route("/wp-admin/index.php", get(handlers::wp_admin_index))
             .route("/wp-admin/", get(handlers::wp_admin_index))
-            .route("/wp-admin/{*rest}", any(handlers::post_exploit_capture));
+            .route("/wp-admin/{*rest}", any(handlers::post_exploit_capture))
+            // Batch sits here rather than with the credential routes: a real
+            // 25-request batch exceeds the 4 KiB body limit, and a 413 would
+            // end the engagement before the payload arrives. Write
+            // amplification is bounded inside the handler instead.
+            .route("/wp-json/batch/v1", any(restapi::batch))
+            .route("/wp-json/batch/v1/", any(restapi::batch));
     }
 
     let app = Router::new()
         .route("/health", get(health))
-        .merge(cred_routes)
-        .merge(cms_routes)
-        .merge(admin_routes)
+        // Body limits are applied HERE, not at Router::new(): axum's
+        // `Router::layer` wraps only the routes registered before the call, so
+        // a limit set on an empty router is silently inert and every route
+        // fell back to axum's 2 MiB default.
+        .merge(cred_routes.layer(axum::extract::DefaultBodyLimit::max(
+            handlers::MAX_POST_BODY_BYTES,
+        )))
+        .merge(cms_routes.layer(axum::extract::DefaultBodyLimit::max(
+            handlers::MAX_EXPLOIT_BODY_BYTES,
+        )))
+        .merge(admin_routes.layer(axum::extract::DefaultBodyLimit::max(
+            handlers::MAX_EXPLOIT_BODY_BYTES,
+        )))
         // Unmatched path and unmatched method both used to answer straight out
         // of axum (404 / 405) with no row written. Both are attacker signal —
         // `GET /xmlrpc.php` and `/wp-config.php` are among the most probed
@@ -268,6 +319,9 @@ async fn main() {
             state.clone(),
             limit_honeypot,
         ))
+        // Outermost, so it also dresses the rate-limiter's WP error page and
+        // the unrouted-probe fallback.
+        .layer(axum::middleware::from_fn(facade::dress_as_wordpress))
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")

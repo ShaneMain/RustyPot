@@ -27,11 +27,24 @@ Bots race to complete WordPress's setup wizard on fresh installs — whoever fin
 
 `GET /.env` returns a realistic `.env` file containing a per-IP planted DB password (`fk` + 12 chars, deterministic from IP hash). The password is inserted into `granted_credentials`. If an attacker reads the `.env` and later submits that password at any login form, the submission is captured and matchable to the original probe — correlating the attacker across vectors.
 
+The planted pair is recorded in `honeypot_event.planted_user` / `planted_pass` — **never** in `submitted_user` / `submitted_pass`. Those two columns mean "the attacker sent us this", exclusively. (They did not always: the trap originally wrote plants into the `submitted_*` columns, which made the honeypot's own output indistinguishable from attacker input and inflated every credential metric roughly fourfold. Migration `004` separates the historical rows.)
+
 ## Attacker engagement
 
 Beyond passive capture, RustyPot actively wastes attacker resources:
 
 - **Tarpit escalation** — after each fake-success grant, the tarpit delay for failed attempts increases: 30s → 60s → 120s → 240s (capped below Cloud Run's timeout). The attacker's throughput drops progressively.
+- **Slow-response budget** — every delaying trap reserves a slot before it
+  holds a request open (`SLOW_RESPONSE_BUDGET`, default 64). Cloud Run gives
+  this service `containerConcurrency` 80 across `maxScale` 3 — 240 request
+  slots — and a held response occupies one for its full duration. Without a cap,
+  enough parallel tarpits would fill the pool and the honeypot would stop being
+  able to record new probes: tarpitting itself out of existence. When the budget
+  is spent the trap answers immediately instead, and logs a delay of 0, so
+  `response_delay_ms` always reflects time actually spent rather than time
+  intended. A fast response is unremarkable to an attacker; a request the
+  platform kills at its 300 s timeout is a 504 that identifies the trap.
+- **Recon tarpit** — the `.env` and `.git` families get their own, much shorter ladder (`RECON_TARPIT_ESCALATION`, default `0,2,5,10,20` s), stepped by how many recon paths the IP has swept (`RECON_TARPIT_STEP`, default 10). Secrets harvesting is the most common objective observed, and it used to be the one family that cost the attacker nothing. The ladder is deliberately short: sweepers hit hundreds of paths, and a 30–240 s hold per path would pin every instance and starve the credential traps. A one-off probe sits on rung 0; a 300-path enumerator climbs.
 - **Canary links** — every link in the fake admin dashboard carries a per-IP tracking token (`?fk=...`). When a bot clicks any link, the token is logged, mapping their post-exploitation path sequence.
 - **Git loop** — `/.git/config` returns a realistic git config. `/.git/objects/` returns HTML directory listings. Each object page links to 3 more subdirectories, each with 10 objects — an infinite chain for HTML-following scanners. Pack files return 8KB with valid `PACK` headers.
 - **Cookie bombing** — the first fake-success response sets 20 cookies of 400 bytes each (~9KB). The attacker's HTTP client echoes all cookies on every subsequent request, cutting effective throughput.
@@ -52,17 +65,27 @@ Beyond passive capture, RustyPot actively wastes attacker resources:
 | `/.env*` (any variant: `.env.dev`, `.envrc`, `.env_copy`, ...) and `/{subdir}/.env*` | any | Fake `.env` with per-IP planted credential — matches any path segment containing `.env` |
 | **Active traps** | | |
 | `/.git/*` | any | Infinite git-object chain (config → HEAD → refs → objects → loop) |
+| `/wp-admin/admin-ajax.php` | any | Plugin exploit surface: parses the account a privilege-escalation creates (recorded `origin='ajax'`, grants instantly at login), answers injection attempts with a fabricated `wp_users` dump |
+| `/wp-content/plugins/*/*.php` | any | Plugin entry points — the exploit the fingerprint bait advertises now lands somewhere instead of 404ing |
 | `/wp-admin/*` | any | Fake dashboard with canary links. POST: capture body |
 | `/admin/*` `/administrator/*` | any | Drupal/Django/Joomla post-login capture |
+| `/wp-json/batch/v1` | any | Real batch semantics — one row per bundled sub-request, so a 50-attempt amplification batch reads as 50 attempts |
 | `/wp-json/*` | any | GET: 200 `[]`. POST: capture body, return 201 |
+| `/.aws/credentials` `/.git-credentials` `/.gitconfig` `/.gitlab-ci.yml` `/.github/workflows/*` `/.npmrc` `/.docker/config.json` | any | Secret-file honeytokens with a per-IP planted credential (`origin='secret'`) |
+| `/phpinfo.php` | any | Full fake `phpinfo()` (~27 KB) with planted credentials in the environment block |
+| `/actuator` `/actuator/env` `/actuator/health` `/actuator/mappings` `/actuator/configprops` | any | Spring Boot Actuator with planted datasource credentials |
+| `/actuator/heapdump` | any | Valid HPROF header, then a slow trickle — the one endpoint attackers expect to be huge and slow. Holds a budget slot for the stream, released on hang-up; served whole and fast when the budget is spent |
+| `/phpmyadmin/*` `/pma/*` `/dbadmin/*` `/adminer.php` (15 spellings) | any | phpMyAdmin login form + credential capture |
+| `/wp-includes/js/*` `/wp-includes/css/*` `/wp-admin/css/*` | any | Core JS/CSS. A real WordPress always serves these; 404ing them identified the install as fake |
 | **Passive 404 + log** | | |
 | `/.svn/*` `/.hg/*` | any | VCS exposure |
-| `/.aws/*` `/.ssh/*` | any | Cloud key / SSH key probes |
-| `/actuator/*` `/_ignition/*` | any | Spring Boot / Laravel debug endpoints |
+| `/.ssh/*` | any | SSH key probes |
+| `/_ignition/*` | any | Laravel debug endpoint |
 | `/solr/*` `/server-status` `/server-info` | any | Service exposure |
 | `/composer.json` `/package.json` | GET | Dependency file probes |
-| `/phpinfo.php` `/shell.php` `/c99.php` `/r57.php` `/webshell.php` `/index.php` | any | PHP shell probes |
-| `/phpmyadmin/*` `/phpMyAdmin/*` `/pma/*` `/dbadmin/*` `/mysql/*` `/sqlmanager/*` `/adminer.php` | any | DB admin variants |
+| `/shell.php` `/c99.php` `/r57.php` `/webshell.php` | any | PHP shell probes |
+| `/index.php` | any | PHP probe; also serves an injected XML-RPC canary post back to the IP that injected it |
+| `/mysql/*` `/sqlmanager/*` | any | DB admin variants |
 | **Fingerprint bait** | | |
 | `/wp-includes/version.php` | any | Raw core `version.php` naming an outdated `$wp_version` |
 | `/readme.html` | any | Core readme naming the same version |
@@ -70,6 +93,75 @@ Beyond passive capture, RustyPot actively wastes attacker resources:
 | `/wp-content/themes/{slug}/style.css` | any | Theme header with an outdated `Version:` |
 | **Catch-all** | | |
 | anything else the edge routes here | any | Logged, then 404 — including method mismatches (`GET /xmlrpc.php`) |
+
+## Secret-file honeytokens
+
+Beyond `.env`, every file an attacker reads specifically to extract a
+credential is a honeytoken vector on the same model: `.aws/credentials`,
+`.aws/config`, `.git-credentials`, `.gitconfig`, `.gitlab-ci.yml`,
+`.github/workflows/*.yml`, `.npmrc`, `.docker/config.json`. Each carries a
+deterministic per-IP secret recorded with `origin='secret'`.
+
+`.aws/credentials` is the highest-intel member. Set `AWS_CANARY_ACCESS_KEY_ID`
+and `AWS_CANARY_SECRET_ACCESS_KEY` to a **real** AWS canary token (a
+permissionless IAM user with a CloudTrail alarm) and you learn the attacker's
+IP at the moment they *use* the key — the only signal here that survives their
+infrastructure rotation. A genuine canary is necessarily one fixed credential,
+so per-IP attribution comes from the `honeypot_event` row that recorded serving
+it, matched on time. Unset, the file carries a per-IP fake with the right shape.
+
+`/phpinfo.php` and `/actuator/env` plant the same way: both are pages whose
+whole purpose is dumping the process environment, so credentials in them look
+like a misconfiguration rather than bait.
+
+## Impersonated crawlers
+
+User-agents branded as ChatGPT-User, PerplexityBot, Amazonbot, GPTBot and
+friends show up requesting `.env`, `.aws/credentials` and login forms. No
+legitimate crawler does that; the branding is chosen because sites commonly
+allowlist those crawlers. Requests matching a crawler user-agent **on a path no
+crawler would request** get a distinct honeytoken prefix (`fk` → `fkx`), so a
+credential surfacing later carries "this actor impersonates AI crawlers" as a
+tooling fingerprint without needing a join.
+
+## Wire-level disguise
+
+Every HTML trap response is dressed as PHP-served WordPress by middleware —
+`X-Powered-By`, WordPress's fixed 1984 `Expires`, the no-cache pair, the
+`wordpress_test_cookie` on `wp-login.php`, and the `Link: rel="https://api.w.org/"`
+REST advertisement. `cloudflare-worker.js` strips the hosting platform's
+`server: Google Frontend` and `x-cloud-trace-context` on the way back, which
+the container cannot do itself. Applied centrally so a new trap cannot forget
+it: the missing headers were a single tell that undermined every trap at once.
+
+## Content-injection canary
+
+`metaWeblog.newPost` probes inject a unique token as the post title and body,
+then search the web for it — if it appears, the site accepts unauthenticated
+publishing and joins a spam farm. RustyPot reports success with a post id and
+serves the token back at `/index.php?p=<id>`, which earns the follow-up visit.
+
+**The injected content is served only to the IP that injected it, only with
+`X-Robots-Tag: noindex`, and always HTML-escaped.** Attacker-supplied content
+reachable by anyone else, or indexable, would turn this service into a spam
+relay for whatever they inject next. The store is bounded at 512 posts.
+
+## Reading the data
+
+Query **`honeypot_event_live`**, not `honeypot_event`. The raw table also holds:
+
+- **Synthetic rows** (`synthetic = TRUE`) — written by the out-of-band backfill
+  importers, not captured by this service. They carry no POST body, no real
+  headers, and in the `drop-recovery` case an *inferred* source IP. Aggregating
+  them with live captures fabricates attacker behaviour that was never observed.
+- **Cloudflare-origin rows** — requests whose client is Cloudflare itself
+  (`cf-connecting-ip` is a Cloudflare address), not an attacker proxied through
+  it. `is_cloudflare_origin(source_ip)` tests this against the `cloudflare_ranges`
+  table; refresh that table from https://www.cloudflare.com/ips/ when the
+  published prefixes change.
+
+The view excludes both. `honeypot_event` remains the place to answer questions
+*about* capture coverage — which is what the provenance panel does.
 
 Every request that reaches the service is recorded, including ones it answers
 with 404 or 503 — the paths RustyPot does *not* yet trap are the feed for

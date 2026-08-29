@@ -88,7 +88,9 @@ pub async fn xmlrpc(
     body: Bytes,
 ) -> Result<Response, Error> {
     // Base ladder entry — xmlrpc has no grant/threshold tracking, so no escalation.
-    let tarpit_secs = state.settings.tarpit_delay(0);
+    let desired_secs = state.settings.tarpit_delay(0);
+    let permit = crate::tarpit::try_reserve(&state.slow_budget);
+    let tarpit_secs = crate::tarpit::effective_delay(desired_secs, &permit);
     let body_str = body_to_string(&body);
     let (user, pass) = parse_xmlrpc_creds(&body_str);
     let delay_ms = u32::try_from(tarpit_secs * 1000).unwrap_or(0);
@@ -105,7 +107,33 @@ pub async fn xmlrpc(
         delay_ms,
     )
     .await?;
-    tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
+    if tarpit_secs > 0 {
+        tokio::time::sleep(Duration::from_secs(tarpit_secs)).await;
+    }
+    drop(permit);
+
+    // Content injection, not authentication: the caller wants to know whether
+    // the site will publish for it. Report success and keep the canary, so the
+    // check that follows finds what it is looking for and the actor comes back
+    // with its real payload instead of moving on.
+    if parsers::is_publishing_method(&body_str) {
+        let ip: std::net::IpAddr = crate::headers::extract_source_ip(&headers)
+            .parse()
+            .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+        let content = parsers::xmlrpc_struct_member(&body_str, "description")
+            .or_else(|| parsers::xmlrpc_struct_member(&body_str, "title"))
+            .unwrap_or_default();
+        let id = crate::canary::store_post(&state.canary_posts, &ip, &content);
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/xml; charset=utf-8")],
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<methodResponse><params><param><value><string>{id}</string></value></param></params></methodResponse>\n"
+            ),
+        )
+            .into_response());
+    }
+
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/xml; charset=utf-8")],
@@ -467,6 +495,44 @@ pub async fn php_probe(
     headers: HeaderMap,
     method: Method,
 ) -> Result<Response, Error> {
+    // `/index.php?p=<id>` is where a content-injection probe looks for the post
+    // it just published. Served to the injecting IP only — see canary.rs.
+    if let Some(id) = uri
+        .query()
+        .and_then(|q| parsers::extract_form_field(q, "p"))
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        let ip: std::net::IpAddr = crate::headers::extract_source_ip(&headers)
+            .parse()
+            .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
+        if let Some(content) = crate::canary::fetch_post(&state.canary_posts, id, &ip) {
+            log_event(
+                &state,
+                &headers,
+                &method,
+                uri.path(),
+                uri.query(),
+                None,
+                None,
+                None,
+                200,
+                0,
+            )
+            .await?;
+            return Ok((
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "text/html; charset=UTF-8"),
+                    (
+                        axum::http::HeaderName::from_static("x-robots-tag"),
+                        "noindex, nofollow",
+                    ),
+                ],
+                crate::canary::render_post(id, &content),
+            )
+                .into_response());
+        }
+    }
     log_event(
         &state,
         &headers,
@@ -623,6 +689,17 @@ pub async fn env_honeytrap(
     let path = uri.path();
     let variant = env_variant(path);
 
+    // Secrets harvesting is the single most common objective we observe, and
+    // until now it was the one family that cost the attacker nothing: served
+    // instantly, no escalation. The ladder is indexed by how deep into their
+    // sweep this IP is, so a one-off probe stays fast and a 300-path enumerator
+    // slows to a crawl.
+    let sweep = crate::sticky::record_recon_hit(&state.recon_tracker, &ip);
+    let desired_secs = state.settings.recon_tarpit_delay(sweep);
+    let permit = crate::tarpit::try_reserve(&state.slow_budget);
+    let delay_secs = crate::tarpit::effective_delay(desired_secs, &permit);
+    let delay_ms = u32::try_from(delay_secs * 1000).unwrap_or(0);
+
     if variant.placeholder {
         sink::log_event(
             &state,
@@ -634,9 +711,13 @@ pub async fn env_honeytrap(
             None,
             None,
             200,
-            0,
+            delay_ms,
         )
         .await?;
+        if delay_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+        drop(permit);
         return Ok((
             StatusCode::OK,
             [(
@@ -648,8 +729,9 @@ pub async fn env_honeytrap(
             .into_response());
     }
 
-    let credential =
-        crate::sticky::planted_credential(&ip, path, &state.settings.honeytoken_prefix);
+    let prefix =
+        crate::sticky::honeytoken_prefix(&state.settings.honeytoken_prefix, &headers, path);
+    let credential = crate::sticky::planted_credential(&ip, path, &prefix);
     let env_content = build_env_file(variant, &credential);
 
     let _ = sink::record_granted_credential(
@@ -661,19 +743,26 @@ pub async fn env_honeytrap(
     )
     .await;
 
-    sink::log_event(
+    // planted, NOT submitted: this credential is ours, the attacker has not
+    // sent us anything. Conflating the two is what made every credential
+    // panel read ~4x high.
+    sink::log_planted_event(
         &state,
         &headers,
         &method,
         path,
         uri.query(),
-        None,
         Some(variant.db_user),
         Some(&credential),
         200,
-        0,
+        delay_ms,
     )
     .await?;
+
+    if delay_secs > 0 {
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+    }
+    drop(permit);
 
     Ok((
         StatusCode::OK,
