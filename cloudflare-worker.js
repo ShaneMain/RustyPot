@@ -42,21 +42,22 @@ function withGeoHeaders(request) {
 /**
  * Strip the hosting platform's fingerprints from honeypot responses.
  *
- * Cloud Run stamps `server: Google Frontend` and `x-cloud-trace-context` on
- * every response. A honeypot serving fake WordPress from an origin that
- * announces itself as Google Frontend is identifiable before a bot ever
- * submits a credential, which undermines every trap behind it. The origin
- * cannot remove these itself — they are added downstream of the container — so
- * the rewrite has to happen here.
+ * Cloud Run stamps `x-cloud-trace-context` on every response and it survives
+ * all the way to the client — a Google Cloud tell on what is meant to look like
+ * a PHP host. The container cannot remove it; the header is added downstream of
+ * it, so the strip has to happen here.
  *
- * The application sets the PHP/WordPress headers; this only removes the
- * contradicting ones and supplies the `server` a PHP host would send.
+ * `server` is deliberately NOT rewritten. Cloudflare already replaces whatever
+ * the origin sent with `server: cloudflare`, which is what every
+ * Cloudflare-fronted site returns and therefore reveals nothing. Setting it to
+ * a fake nginx here would be overwritten anyway, and a value that disagreed
+ * with the rest of the CF response set would be more conspicuous than the
+ * default.
  */
 function disguiseOrigin(upstream) {
   const headers = new Headers(upstream.headers);
   headers.delete("x-cloud-trace-context");
   headers.delete("alt-svc");
-  headers.set("server", "nginx/1.24.0");
   return new Response(upstream.body, {
     status: upstream.status,
     statusText: upstream.statusText,

@@ -129,10 +129,16 @@ tooling fingerprint without needing a join.
 Every HTML trap response is dressed as PHP-served WordPress by middleware —
 `X-Powered-By`, WordPress's fixed 1984 `Expires`, the no-cache pair, the
 `wordpress_test_cookie` on `wp-login.php`, and the `Link: rel="https://api.w.org/"`
-REST advertisement. `cloudflare-worker.js` strips the hosting platform's
-`server: Google Frontend` and `x-cloud-trace-context` on the way back, which
-the container cannot do itself. Applied centrally so a new trap cannot forget
-it: the missing headers were a single tell that undermined every trap at once.
+REST advertisement. `cloudflare-worker.js` strips `x-cloud-trace-context`
+on the way back, which the container cannot do itself and which otherwise
+reaches the client on every response. (`server` needs no rewrite: Cloudflare
+already replaces the origin's value with `server: cloudflare`.) Applied
+centrally so a new trap cannot forget it.
+
+`PUBLIC_HOSTNAME` supplies the host for the REST `Link` header. It is never
+derived from the request's `Host`: behind the edge that is the origin's own
+address, so echoing it would publish the backend URL and identify the stack.
+Unset, the header is simply omitted.
 
 ## Content-injection canary
 

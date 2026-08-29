@@ -321,7 +321,10 @@ async fn main() {
         ))
         // Outermost, so it also dresses the rate-limiter's WP error page and
         // the unrouted-probe fallback.
-        .layer(axum::middleware::from_fn(facade::dress_as_wordpress))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            facade::dress_as_wordpress,
+        ))
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")

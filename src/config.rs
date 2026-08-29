@@ -134,6 +134,15 @@ pub struct Settings {
     /// for its full duration. The default leaves the large majority of that
     /// capacity free for recording new probes.
     pub slow_response_budget: usize,
+    /// Public hostname to advertise in WordPress's REST `Link` header.
+    ///
+    /// MUST NOT be derived from the request's `Host`. Behind the edge Worker
+    /// the origin sees the Cloud Run hostname, so echoing `Host` published
+    /// `<https://fillerkiller-honeypot-….run.app/wp-json/>` on every response:
+    /// it identified the stack as Cloud Run rather than PHP, and handed
+    /// attackers the backend URL to bypass the edge entirely. Unset → the
+    /// header is omitted, which is harmless; leaking the origin is not.
+    pub public_hostname: Option<String>,
 }
 
 impl Default for Settings {
@@ -153,6 +162,7 @@ impl Default for Settings {
             heapdump_bytes: 2 * 1024 * 1024,
             heapdump_seconds: 60,
             slow_response_budget: 64,
+            public_hostname: None,
         }
     }
 }
@@ -233,6 +243,16 @@ impl Settings {
             0,
             240,
         ));
+        s.public_hostname = env::var("PUBLIC_HOSTNAME")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| {
+                // A hostname only: no scheme, path, or header-splitting bytes.
+                !v.is_empty()
+                    && v.len() <= 253
+                    && v.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            });
         s.slow_response_budget = env_num(
             "SLOW_RESPONSE_BUDGET",
             u32::try_from(d.slow_response_budget).unwrap_or(64),

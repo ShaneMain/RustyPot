@@ -49,7 +49,12 @@ fn apply_login_cookie(resp: &mut Response) {
 /// `Link: <...>; rel="https://api.w.org/"` — WordPress advertises its REST
 /// root on every front-end response. Scanners use it to confirm WP and to
 /// discover `/wp-json/`, which is itself a trap.
-fn apply_rest_link(resp: &mut Response, host: &str) {
+fn apply_rest_link(resp: &mut Response, host: Option<&str>) {
+    // No configured hostname → no header. Deriving one from the request's
+    // `Host` would publish the origin's own address; see Settings::public_hostname.
+    let Some(host) = host else {
+        return;
+    };
     let value = format!("<https://{host}/wp-json/>; rel=\"https://api.w.org/\"");
     if let Ok(v) = HeaderValue::from_str(&value) {
         resp.headers_mut().insert("link", v);
@@ -61,16 +66,11 @@ fn apply_rest_link(resp: &mut Response, host: &str) {
 /// forget it — the missing headers were a single tell that undermined every
 /// trap at once.
 pub async fn dress_as_wordpress(
+    axum::extract::State(state): axum::extract::State<crate::HoneypotState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let path = req.uri().path().to_owned();
-    let host = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("fillerkiller.app")
-        .to_owned();
     let mut resp = next.run(req).await;
 
     // Static assets are cacheable and must keep their own cache headers; the
@@ -85,7 +85,7 @@ pub async fn dress_as_wordpress(
     }
 
     apply_php_headers(&mut resp);
-    apply_rest_link(&mut resp, &host);
+    apply_rest_link(&mut resp, state.settings.public_hostname.as_deref());
     if path == "/wp-login.php" {
         apply_login_cookie(&mut resp);
     }
@@ -127,9 +127,19 @@ mod tests {
     #[test]
     fn rest_link_names_the_wp_json_root() {
         let mut resp = Html("<html></html>").into_response();
-        apply_rest_link(&mut resp, "example.com");
+        apply_rest_link(&mut resp, Some("example.com"));
         let link = resp.headers().get("link").unwrap().to_str().unwrap();
-        assert!(link.contains("/wp-json/"));
+        assert!(link.contains("https://example.com/wp-json/"));
         assert!(link.contains("rel=\"https://api.w.org/\""));
+    }
+
+    #[test]
+    fn rest_link_is_omitted_without_a_configured_hostname() {
+        // Regression: the header was built from the request Host, which behind
+        // the edge is the Cloud Run origin — publishing the backend URL and
+        // identifying the stack. Omitting it is the safe default.
+        let mut resp = Html("<html></html>").into_response();
+        apply_rest_link(&mut resp, None);
+        assert!(resp.headers().get("link").is_none());
     }
 }
